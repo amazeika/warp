@@ -271,6 +271,10 @@ fn register_tests() -> HashMap<&'static str, BoxedBuilderFn> {
     register_test!(test_ssh_into_fish);
     register_test!(test_ssh_into_sh);
     register_test!(test_ssh_into_ash);
+    register_test!(test_ssh_wrapper_attach_fails_closed_on_dead_control_socket);
+    register_test!(test_ssh_wrapper_attach_rejects_unsupported_control_path_characters);
+    register_test!(test_ssh_wrapper_attach_request_is_one_shot);
+    register_test!(test_ssh_wrapper_attach_fails_closed_on_early_return_path);
     register_test!(test_ssh_with_shell_override);
 
     // Remote server integration tests

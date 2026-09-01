@@ -676,10 +676,22 @@ if test "$WARP_IS_LOCAL_SHELL_SESSION" = "1"
     end
 
     function warp_ssh_helper
+        # Consume the split-pane attach request first, before any other path can
+        # return.
+        set -l attach_control_path "$WARP_SSH_ATTACH_CONTROL_PATH"
+        set -e WARP_SSH_ATTACH_CONTROL_PATH
+
         set -l init_shell_zsh (warp_init_shell "zsh")
         set -l init_shell_bash (warp_init_shell "bash")
         set -l remote_session_id (command od -An -N8 -tu8 /dev/urandom 2>/dev/null | command tr -d ' \n')
         if test -z "$remote_session_id"; or test "$remote_session_id" = "0"
+            # Every fallback here runs plain `ssh`, which for an attach request
+            # would dial a fresh connection and prompt for the credentials the
+            # split exists to avoid. Refuse instead.
+            if test -n "$attach_control_path"
+                echo "warp: cannot reuse the SSH connection this pane was split from (could not generate a session id)" >&2
+                return 1
+            end
             # If we cannot generate a non-zero random token, run plain SSH instead.
             command ssh $argv
             return
@@ -692,6 +704,10 @@ if test "$WARP_IS_LOCAL_SHELL_SESSION" = "1"
         # to plain SSH. `ssh -G` prints `remotecommand none` when unset.
         set -l user_remote_command (command ssh -G $argv 2>/dev/null | command sed -n 's/^remotecommand //p')
         if test -n "$user_remote_command"; and test "$user_remote_command" != "none"
+            if test -n "$attach_control_path"
+                echo "warp: cannot reuse the SSH connection this pane was split from (this destination configures its own RemoteCommand)" >&2
+                return 1
+            end
             command ssh $argv
             return
         end
@@ -711,7 +727,36 @@ if test "$WARP_IS_LOCAL_SHELL_SESSION" = "1"
         set -l control_path "$SSH_SOCKET_DIR/$WARP_SESSION_ID"
         set -l control_master_mode "yes"
         set -l external_control_master "false"
-        if test "$WARP_SSH_REUSE_CONTROL_MASTER" = "1"
+
+        # Attach mode: multiplex onto the connection the pane we were split from
+        # already authenticated, so the user is not prompted again. The request
+        # itself was consumed at the top of this function.
+        set -l attach_guard
+        if test -n "$attach_control_path"
+            if not string match --quiet --regex '^[A-Za-z0-9._/~@:+,-]+$' -- "$attach_control_path"
+                # Same restriction as the branch below: the path is embedded in
+                # the SSH hook JSON further down.
+                echo "warp: cannot reuse the SSH connection this pane was split from (its socket path has unsupported characters)" >&2
+                return 1
+            end
+            if not command ssh -O check -o ControlPath="$attach_control_path" $argv >/dev/null 2>&1
+                echo "warp: cannot reuse the SSH connection this pane was split from (that connection is gone)" >&2
+                return 1
+            end
+            set control_path "$attach_control_path"
+            set control_master_mode "no"
+            # `ControlMaster=no` only *prefers* the socket: if the master dies
+            # between the check above and the connection below, OpenSSH dials the
+            # destination directly and prompts for credentials. Neither option is
+            # consulted when the socket is live, so disabling both transports
+            # makes attach mode succeed over the master or fail, never silently
+            # reconnect.
+            set attach_guard -o ProxyCommand=false -o ProxyJump=none
+            # We joined this master, we did not create it, so we must never tear
+            # it down. Another pane is still using it, including the one we were
+            # split from.
+            set external_control_master "true"
+        else if test "$WARP_SSH_REUSE_CONTROL_MASTER" = "1"
             set -l user_control_path (command ssh -G $argv 2>/dev/null | command sed -n 's/^controlpath //p')
             # Skip when no ControlPath is configured, and reject resolved
             # paths containing characters we cannot safely embed in the SSH
@@ -737,7 +782,7 @@ if test "$WARP_IS_LOCAL_SHELL_SESSION" = "1"
         # the remote shell is the Bourne shell to avoid asking it to parse later lines that use syntax it doesn't
         # support.
         command ssh -o ControlMaster=$control_master_mode -o ControlPath="$control_path" \
-        -t $argv \
+        $attach_guard -t $argv \
 "
 export TERM_PROGRAM='WarpTerminal'
 test -n '$WARP_CLIENT_VERSION' && export WARP_CLIENT_VERSION='$WARP_CLIENT_VERSION'

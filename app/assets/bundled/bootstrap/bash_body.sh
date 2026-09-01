@@ -1172,10 +1172,21 @@ if [ -z "$WARP_BOOTSTRAPPED" ]; then
         }
 
         function warp_ssh_helper() {
+            # Consume the split-pane attach request first, before any other path
+            # can return. Warp sets this only for a pane split out of an SSH
+            # session, so it is normally absent and must be read defensively for
+            # shells running with `set -u`.
+            local attach_control_path="${WARP_SSH_ATTACH_CONTROL_PATH-}"
+            unset WARP_SSH_ATTACH_CONTROL_PATH
+
             init_shell_bash=$(init_shell_hook "bash")
             init_shell_zsh=$(init_shell_hook "zsh")
             local remote_session_id=$(command -p od -An -N8 -tu8 /dev/urandom 2>/dev/null | command -p tr -d ' \n')
             if [[ -z "$remote_session_id" || "$remote_session_id" == "0" ]]; then
+                if [[ -n "$attach_control_path" ]]; then
+                    printf '%s\n' "warp: cannot reuse the SSH connection this pane was split from (could not generate a session id)" >&2
+                    return 1
+                fi
                 # If we cannot generate a non-zero random token, run plain SSH instead.
                 command ssh "${@:1}"
                 return
@@ -1188,6 +1199,10 @@ if [ -z "$WARP_BOOTSTRAPPED" ]; then
             # back to plain SSH. `ssh -G` prints `remotecommand none` when unset.
             local user_remote_command=$(command ssh -G "${@:1}" 2>/dev/null | command -p sed -n 's/^remotecommand //p')
             if [[ -n "$user_remote_command" && "$user_remote_command" != "none" ]]; then
+                if [[ -n "$attach_control_path" ]]; then
+                    printf '%s\n' "warp: cannot reuse the SSH connection this pane was split from (this destination configures its own RemoteCommand)" >&2
+                    return 1
+                fi
                 command ssh "${@:1}"
                 return
             fi
@@ -1207,7 +1222,38 @@ if [ -z "$WARP_BOOTSTRAPPED" ]; then
             local control_path="$SSH_SOCKET_DIR/$WARP_SESSION_ID"
             local control_master_mode="yes"
             local external_control_master="false"
-            if [[ "$WARP_SSH_REUSE_CONTROL_MASTER" == "1" ]]; then
+
+            # Attach mode: multiplex onto the connection the pane we were split
+            # from already authenticated, so the user is not prompted again. The
+            # request itself was consumed at the top of this function.
+            local attach_guard=()
+            if [[ -n "$attach_control_path" ]]; then
+                case "$attach_control_path" in
+                    *[![:alnum:]._/~@:+,-]*)
+                        # Same restriction as the branch below: the path is
+                        # embedded in the SSH hook JSON further down.
+                        printf '%s\n' "warp: cannot reuse the SSH connection this pane was split from (its socket path has unsupported characters)" >&2
+                        return 1
+                        ;;
+                esac
+                if ! command ssh -O check -o ControlPath="$attach_control_path" "${@:1}" >/dev/null 2>&1; then
+                    printf '%s\n' "warp: cannot reuse the SSH connection this pane was split from (that connection is gone)" >&2
+                    return 1
+                fi
+                control_path="$attach_control_path"
+                control_master_mode="no"
+                # `ControlMaster=no` only *prefers* the socket: if the master dies
+                # between the check above and the connection below, OpenSSH dials
+                # the destination directly and prompts for credentials. Neither
+                # option is consulted when the socket is live, so disabling both
+                # transports makes attach mode succeed over the master or fail,
+                # never silently reconnect.
+                attach_guard=(-o ProxyCommand=false -o ProxyJump=none)
+                # We joined this master, we did not create it, so we must never
+                # tear it down. Another pane is still using it, including the one
+                # we were split from.
+                external_control_master="true"
+            elif [[ "$WARP_SSH_REUSE_CONTROL_MASTER" == "1" ]]; then
                 local user_control_path=$(command ssh -G "${@:1}" 2>/dev/null | command -p sed -n 's/^controlpath //p')
                 case "$user_control_path" in
                     "" | none)
@@ -1238,8 +1284,12 @@ if [ -z "$WARP_BOOTSTRAPPED" ]; then
             # determine what shell is the login shell on the remote machine.  We perform a preliminary check to see if
             # the remote shell is the Bourne shell to avoid asking it to parse later lines that use syntax it doesn't
             # support.
+            # bash 3.2, which is still /bin/bash on macOS, treats "${a[@]}" on
+            # an empty array as an unbound variable under `set -u`, and this
+            # array is empty on every non-attach call. The ${a[@]+...} form is
+            # the portable way to expand it to nothing instead of aborting.
             command ssh -o ControlMaster=$control_master_mode -o ControlPath="$control_path" \
-            -t "${@:1}" \
+            ${attach_guard[@]+"${attach_guard[@]}"} -t "${@:1}" \
 "
 export TERM_PROGRAM='WarpTerminal'
 # Mark the remote side of a Warp-managed SSH session so the bootstrap
