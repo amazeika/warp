@@ -275,6 +275,9 @@ fn register_tests() -> HashMap<&'static str, BoxedBuilderFn> {
     register_test!(test_ssh_wrapper_attach_rejects_unsupported_control_path_characters);
     register_test!(test_ssh_wrapper_attach_request_is_one_shot);
     register_test!(test_ssh_wrapper_attach_fails_closed_on_early_return_path);
+    register_test!(test_ssh_wrapper_persist_adds_control_persist_when_enabled);
+    register_test!(test_ssh_wrapper_persist_omitted_when_disabled);
+    register_test!(test_ssh_wrapper_persist_not_added_when_attaching);
     register_test!(test_ssh_with_shell_override);
 
     // Remote server integration tests

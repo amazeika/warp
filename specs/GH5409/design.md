@@ -3,7 +3,7 @@ status: in-progress
 issue: 5409
 tracking: amazeika/warp#1
 pr: null
-completed: [1]
+completed: [1, 2]
 ---
 
 # Reuse the SSH connection when splitting a pane — Design Document
@@ -391,7 +391,7 @@ panes attached to it, because only the joining session reports external ownershi
 
 **ID:** `2`
 **Goal:** the SSH connection outlives the pane that created it, so panes can be closed in any order
-**Tests:** pending
+**Tests:** `crates/integration/src/test/ssh_control_persist.rs`, `crates/remote_server/src/ssh_tests.rs`, `crates/warp_terminal/src/local_tty/unix_tests.rs`, `crates/warp_terminal/src/model/ansi/mod_tests.rs`, `crates/warp_terminal/src/model/ansi/dcs_hooks_tests.rs`
 
 **Acceptance criteria:**
 
@@ -422,6 +422,33 @@ panes attached to it, because only the joining session reports external ownershi
    skip on it ([ssh_transport.rs:268-279](../../app/src/remote_server/ssh_transport.rs#L268-L279)).
 5. Confirm `RemoteCommandExecutor` and the remote-server proxy still attach correctly to a
    persisted master.
+
+**Delivered.** `ControlPersist=60` is added only where Warp creates the master — the attach branch
+and the user-master branch both set `control_master_mode=no` before the persist block, so a master
+this session joined never has its lifetime extended. The value travels as a `persist` field in the
+SSH hook JSON, through `SSHValue` and `IsSSHWrapperSession::Yes`, to
+`ControlPath::WarpManaged { socket_path, persist }`, where teardown skips the forced `ssh -O exit`.
+Everything is gated on the new `FeatureFlag::CloneSshOnSplit`, which is in no flag array: with it
+off the `ssh` options, and so master lifetime and teardown, are exactly what they were before.
+
+Three decisions worth recording. `ControlPath::WarpManaged` became a struct variant rather than a
+fourth enum variant, so `UserOwned` and `None` are untouched and no catch-all arm appears over the
+enum. The teardown decision was extracted into a pure `socket_to_force_exit`, so ownership and
+persistence rules are unit-tested without spawning `ssh`. And `WARP_SSH_CONTROL_PERSIST` is read
+nounset-safe, matching the idiom Phase 1 established in this function rather than the bare read its
+neighbour uses.
+
+One deviation from the phase as planned: `fish.sh` gained `export WARP_IS_SSH='1'`, which zsh and
+bash have sent since the initial public release. That variable installs the remote `ExitShell` hook,
+and `ExitShell` is what releases Warp's proxy child so the idle timeout can start — dormant before
+this phase, load-bearing after it. Making a phase's own precondition true is not scope creep, but it
+does touch a Phase 1 file. `.ckit/conventions.yaml` also gained four unit-test rows, since `nextest`
+selects by name substring and the phase's declared test files had no gate.
+
+Adversarial review of this phase raised, and this phase does not fix, whether skipping `-O exit` is
+safe when Warp cannot guarantee the idle timeout ever starts. That is recorded in Open Questions
+with a `TODO(doubt)` breadcrumb at the code site, and gates enabling the flag rather than shipping
+the phase.
 
 ### Phase 3: Bind the originating ssh command to its warpified session
 
@@ -594,8 +621,9 @@ exists for.
 
 - **Default on or off at GA?** The product intent is on; Warp will likely want the flag off through
   at least one release. Settle on the spec PR.
-- **`ControlPersist` value.** A short idle timeout reaps promptly but may re-prompt if a user splits
-  after closing every pane; a long one keeps connections alive longer than some users expect.
+- **`ControlPersist` value.** *Resolved in Phase 2: `ControlPersist=60`.* Long enough that any
+  split-then-close ordering keeps the connection, short enough to bound how long an authenticated
+  session lingers past visible use.
 - **Should the source pane's local launch directory be snapshotted for the new pane's local PTY?**
   Attaching needs no credentials, so relative `-i`/`-F` no longer matter and this is now cosmetic —
   the local PTY is a thin shell that immediately enters SSH. Deferred unless verification shows it
@@ -604,6 +632,42 @@ exists for.
   this is a small follow-up.
 - **Windows/WSL.** Whether the wrapper attach path is reachable and correct there is unexamined
   beyond the same-distro constraint recorded in Phase 4.
+- **Does `ControlPersist` need a last-client check after all?** Section 2 rejected an
+  attached-client check before teardown as "reintroduces refcount bookkeeping", on the premise that
+  the idle timeout reaps a master Warp stops force-exiting. Two independent reviews of Phase 2
+  challenged that premise on evidence, and it is unresolved:
+  - *The timeout may never start.* `ControlPersist` counts idle from when the last multiplexed
+    client is gone. Warp's own `ssh … remote-server-proxy` child is dropped only by
+    `deregister_session`, which fires on `ExitShell`. Any session that never emits `ExitShell`
+    holds the master open indefinitely.
+
+    The reach is wide. `SshRemoteServer` is in both `DOGFOOD_FLAGS`
+    ([lib.rs:1055](../../crates/warp_features/src/lib.rs#L1055)) and `RELEASE_FLAGS`
+    ([:1088](../../crates/warp_features/src/lib.rs#L1088)), so that proxy exists for essentially
+    every SSH session, not only splits. And `ExitShell` is a *remote* DCS hook: on an abrupt pane
+    or tab close the local client dies first, so the hook never arrives. That is a likelier path
+    into this state than the clean-logout case.
+
+    One reproducible instance is closed. `fish.sh`'s remote command never exported
+    `WARP_IS_SSH='1'`, which zsh and bash have sent since the initial public release, and that
+    variable is what installs the remote `ExitShell` hook. Phase 2 adds it, because Phase 2 is what
+    makes `ExitShell` load-bearing. Remote *fish* needs nothing here: all three wrappers warpify
+    only `bash` and `zsh` remotely, so a remote fish login shell is never warpified and never gets
+    a proxy to release.
+  - *A flag flip can sever a split.* `WARP_SSH_CONTROL_PERSIST` is captured at pane spawn
+    ([unix.rs:376](../../crates/warp_terminal/src/local_tty/unix.rs#L376)), not read live. Just
+    after the flag turns on, a pane spawned before it still holds `0` and creates a non-persistent
+    master. A split of that pane attaches to a master whose teardown still runs the forced
+    `ssh -O exit`, so closing the source pane severs the split. It degrades to Phase 1 behaviour
+    rather than breaking anything new, but Phase 4 should gate the attach request on the source
+    session's hook reporting `persist: true`, rather than on the flag.
+  - *Port forwarding outlives the visible session.* `-L`/`-R`/`-D` pass the warpify gate
+    (`is_interactive_ssh_session`'s option list accepts them), so a forwarding session gets a
+    Warp-owned master. Under `ControlPersist` its listeners survive pane close for the timeout —
+    a revocation boundary the design did not weigh.
+  Provisional choice: ship the phase as specified, flag off, and settle this before the flag is
+  enabled anywhere. Options are a last-client force-exit, excluding forwarding invocations from
+  persistence, or accepting a bounded window and documenting it.
 - **`sshd` `MaxSessions` budget.** Each split consumes an interactive channel plus a
   remote-server-proxy channel, so the default budget of 10 allows fewer splits than it appears.
   Whether to surface a specific message at the limit, or simply fail visibly, is unsettled.

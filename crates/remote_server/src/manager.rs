@@ -2366,16 +2366,19 @@ impl RemoteServerManager {
     /// user's interactive ssh process and, without the explicit
     /// `-O exit`, it hangs waiting for remote-side cleanup of
     /// multiplexed channels (see [`crate::ssh::stop_control_master`]).
-    /// Sessions multiplexed through an external master carry
-    /// [`ControlPath::UserOwned`], so this step is skipped and the
-    /// user's master is left running.
+    /// Two kinds of master are skipped there: an external one, which
+    /// carries [`ControlPath::UserOwned`] and belongs to whoever created it
+    /// (the user, or another pane this one was split from), and a
+    /// persistent Warp-owned one, which detached from the interactive ssh
+    /// at connect time and so has no foreground process left to hang.
     ///
     /// Mechanically:
     /// 1. Remove the session entry. Dropping the `RemoteSessionState`
     ///    drops the transport's owned `Child`, which SIGKILLs the
     ///    `ssh … remote-server-proxy` subprocess via `kill_on_drop`.
-    /// 2. If the session's `control_path` is [`ControlPath::WarpManaged`],
-    ///    spawn a background task that runs `ssh -O exit` against it.
+    /// 2. If the session's `control_path` is a non-persistent
+    ///    [`ControlPath::WarpManaged`], spawn a background task that runs
+    ///    `ssh -O exit` against it.
     ///
     /// The `Child` is owned by the manager's state, *not* by
     /// `Arc<RemoteServerClient>`. Lingering `Arc` clones held elsewhere

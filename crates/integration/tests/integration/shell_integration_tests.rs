@@ -101,6 +101,10 @@ integration_tests! {
     test_ssh_wrapper_attach_rejects_unsupported_control_path_characters,
     test_ssh_wrapper_attach_request_is_one_shot,
     test_ssh_wrapper_attach_fails_closed_on_early_return_path,
+    // Tests of ControlPersist on Warp-owned masters (GH5409).
+    test_ssh_wrapper_persist_adds_control_persist_when_enabled,
+    test_ssh_wrapper_persist_omitted_when_disabled,
+    test_ssh_wrapper_persist_not_added_when_attaching,
 
     // Tests of remote server behavior.
     test_remote_server_connect_bash,

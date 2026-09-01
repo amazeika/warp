@@ -140,18 +140,30 @@ impl Error {
 }
 
 /// The SSH `ControlMaster` socket (if any) behind a connection, tagged
-/// with who owns the master process. Ownership decides teardown
-/// behavior: only `WarpManaged` masters are stopped with `ssh -O exit`
-/// on explicit teardown (see [`crate::ssh::stop_control_master`]);
-/// `UserOwned` masters must be left running.
+/// with whether *this* session owns the master process. Ownership decides
+/// teardown behavior: only a non-persistent `WarpManaged` master is
+/// stopped with `ssh -O exit` on explicit teardown (see
+/// [`crate::ssh::stop_control_master`]); a `UserOwned` master belongs to
+/// someone else -- the user, or another pane -- and must be left running.
 #[cfg(not(target_family = "wasm"))]
 #[derive(Debug, Clone)]
 pub enum ControlPath {
     /// Warp created the ControlMaster at this socket path and is
-    /// responsible for tearing it down on session exit.
-    WarpManaged(PathBuf),
-    /// The SSH wrapper attached to a ControlMaster the user already had
-    /// running at this socket path. Warp must never tear it down.
+    /// responsible for its lifetime.
+    WarpManaged {
+        socket_path: PathBuf,
+        /// `true` when the master was created with `ControlPersist` and
+        /// has already detached from the foreground `ssh`. The forced
+        /// `ssh -O exit` exists only to stop that foreground process
+        /// hanging on channel cleanup, so it is skipped here and the
+        /// master is left to expire on its idle timeout.
+        persist: bool,
+    },
+    /// The SSH wrapper attached to a ControlMaster this session did not
+    /// create: either one the user already had running, or a Warp-owned
+    /// master another pane is still using (a split pane joins its source's
+    /// master and reports it as external). Warp must never tear it down
+    /// from here -- the session that created it owns its teardown.
     UserOwned(PathBuf),
     /// No ControlMaster socket (e.g. in-process test transports).
     None,

@@ -582,11 +582,17 @@ pub enum IsSSHWrapperSession {
     /// socket for the underlying connection.
     Yes {
         socket_path: PathBuf,
-        /// `true` when `socket_path` points at a ControlMaster the user
-        /// already had running (the SSH wrapper attached to it instead of
-        /// creating a Warp-owned one). Warp must not tear down such a
-        /// master on session exit.
+        /// `true` when the wrapper attached to a ControlMaster that already
+        /// existed instead of creating one: either the user's own master, or
+        /// a Warp-owned master belonging to the pane this one was split from.
+        /// This session must not tear down such a master on exit.
         external_control_master: bool,
+        /// `true` when the wrapper created this master with `ControlPersist`,
+        /// so it has already detached from the foreground `ssh`. Teardown
+        /// skips the forced `ssh -O exit` for such a master: that exit exists
+        /// only to stop the foreground process from hanging, and there is no
+        /// longer one to hang.
+        persist: bool,
     },
     No,
 }
@@ -670,6 +676,7 @@ impl SessionInfo {
             Some(ssh_value) => IsSSHWrapperSession::Yes {
                 socket_path: ssh_value.socket_path,
                 external_control_master: ssh_value.external_control_master,
+                persist: ssh_value.persist,
             },
             None => IsSSHWrapperSession::No,
         };
@@ -1812,6 +1819,7 @@ pub mod testing {
             self.is_ssh_wrapper_session = IsSSHWrapperSession::Yes {
                 socket_path,
                 external_control_master: false,
+                persist: false,
             };
             self
         }

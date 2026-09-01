@@ -33,11 +33,16 @@ pub(crate) mod installation;
 pub struct SshTransport {
     socket_path: PathBuf,
     auth_context: Arc<RemoteServerAuthContext>,
-    /// Whether Warp owns the ControlMaster behind `socket_path`. `false`
-    /// when the SSH wrapper attached to a master the user already had
-    /// running, in which case Warp must not run `ssh -O exit` against it
-    /// on teardown.
+    /// Whether this session created the ControlMaster behind `socket_path`.
+    /// `false` when the SSH wrapper attached to a master that already
+    /// existed -- the user's own, or one another pane created and is still
+    /// using -- in which case this session must not run `ssh -O exit`
+    /// against it on teardown.
     warp_owns_control_master: bool,
+    /// Whether a Warp-owned master was created with `ControlPersist` and has
+    /// already detached from the foreground `ssh`. Ignored when the master is
+    /// not Warp-owned.
+    control_master_persists: bool,
 }
 
 impl fmt::Debug for SshTransport {
@@ -45,6 +50,7 @@ impl fmt::Debug for SshTransport {
         f.debug_struct("SshTransport")
             .field("socket_path", &self.socket_path)
             .field("warp_owns_control_master", &self.warp_owns_control_master)
+            .field("control_master_persists", &self.control_master_persists)
             .finish_non_exhaustive()
     }
 }
@@ -54,11 +60,13 @@ impl SshTransport {
         socket_path: PathBuf,
         auth_context: Arc<RemoteServerAuthContext>,
         warp_owns_control_master: bool,
+        control_master_persists: bool,
     ) -> Self {
         Self {
             socket_path,
             auth_context,
             warp_owns_control_master,
+            control_master_persists,
         }
     }
 
@@ -68,6 +76,10 @@ impl SshTransport {
 
     pub fn warp_owns_control_master(&self) -> bool {
         self.warp_owns_control_master
+    }
+
+    pub fn control_master_persists(&self) -> bool {
+        self.control_master_persists
     }
 
     pub fn remote_daemon_socket_path(&self) -> String {
@@ -228,6 +240,7 @@ impl RemoteTransport for SshTransport {
     ) -> Pin<Box<dyn Future<Output = Result<Connection>> + Send>> {
         let socket_path = self.socket_path.clone();
         let warp_owns_control_master = self.warp_owns_control_master;
+        let control_master_persists = self.control_master_persists;
         let remote_proxy_command = self.remote_proxy_command();
         Box::pin(async move {
             let mut args = ssh_args(&socket_path);
@@ -268,11 +281,16 @@ impl RemoteTransport for SshTransport {
                 host_response_rx,
                 child,
                 // Tag the socket with master ownership. Teardown only runs
-                // `ssh -O exit` against Warp-managed masters; a user-owned
-                // (external) master must be left running when the Warp
-                // session exits.
+                // `ssh -O exit` against a master this session created that is
+                // not persistent; an external master (the user's own, or one
+                // another pane still uses) must be left running when this
+                // session exits, and a persistent one expires on its own idle
+                // timeout.
                 control_path: if warp_owns_control_master {
-                    ControlPath::WarpManaged(socket_path)
+                    ControlPath::WarpManaged {
+                        socket_path,
+                        persist: control_master_persists,
+                    }
                 } else {
                     ControlPath::UserOwned(socket_path)
                 },

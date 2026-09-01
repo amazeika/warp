@@ -26,7 +26,7 @@ use super::new_builder;
 use crate::Builder;
 
 /// Asserts the last command block's output does *not* match `pattern`.
-fn assert_last_command_block_does_not_match(pattern: &'static str) -> AssertionCallback {
+pub(super) fn assert_last_command_block_does_not_match(pattern: &'static str) -> AssertionCallback {
     Box::new(move |app, window_id| {
         let regex = Regex::new(pattern).expect("regex should not fail to compile");
         let terminal_view = single_terminal_view_for_tab(app, window_id, 0);
@@ -59,7 +59,7 @@ fn assert_last_command_block_does_not_match(pattern: &'static str) -> AssertionC
 /// The completed `ssh` block is not the *active* block by the time assertions
 /// run, because the shell has already opened the next one, so this looks at the
 /// last command block instead.
-fn assert_last_command_block_matches(pattern: &'static str) -> AssertionCallback {
+pub(super) fn assert_last_command_block_matches(pattern: &'static str) -> AssertionCallback {
     Box::new(move |app, window_id| {
         let regex = Regex::new(pattern).expect("regex should not fail to compile");
         validate_block_output(

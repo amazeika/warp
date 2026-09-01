@@ -775,6 +775,22 @@ if test "$WARP_IS_LOCAL_SHELL_SESSION" = "1"
             end
         end
 
+        # A Warp-owned master is given a ControlPersist idle timeout so the
+        # connection outlives the foreground `ssh` that created it and panes
+        # attached to it can be closed in any order. This changes the lifetime of
+        # every Warp SSH connection, split or not, so it is gated on the feature
+        # flag: with the flag off the ssh options below, and so the master's
+        # lifetime and teardown, are exactly what they were before this feature
+        # existed. The remote command still reports persist, as false. A master we
+        # joined rather than created never gets one -- its lifetime is not ours to
+        # extend.
+        set -l persist "false"
+        set -l persist_opts
+        if test "$control_master_mode" = "yes"; and test "$WARP_SSH_CONTROL_PERSIST" = "1"
+            set persist "true"
+            set persist_opts -o ControlPersist=60
+        end
+
         # Note that in this command, we're passing a string to the remote shell. Any variable expansions need to be
         # escaped with "''" to avoid the local shell from expanding them before they're passed to the remote shell.
         # We check the SHELL env var and use shell string manipulation to get the contents after the last slash to
@@ -782,13 +798,17 @@ if test "$WARP_IS_LOCAL_SHELL_SESSION" = "1"
         # the remote shell is the Bourne shell to avoid asking it to parse later lines that use syntax it doesn't
         # support.
         command ssh -o ControlMaster=$control_master_mode -o ControlPath="$control_path" \
-        $attach_guard -t $argv \
+        $attach_guard $persist_opts -t $argv \
 "
 export TERM_PROGRAM='WarpTerminal'
+# Mark the remote side of a Warp-managed SSH session so the bootstrap
+# body can distinguish it from local shells. Used to gate the ExitShell
+# hook which tears down the remote-server-proxy subprocess.
+export WARP_IS_SSH='1'
 test -n '$WARP_CLIENT_VERSION' && export WARP_CLIENT_VERSION='$WARP_CLIENT_VERSION'
 # Only forward the protocol version if it was set locally (i.e. the HOANotifications feature flag is on).
 test -n '$WARP_CLI_AGENT_PROTOCOL_VERSION' && export WARP_CLI_AGENT_PROTOCOL_VERSION='$WARP_CLI_AGENT_PROTOCOL_VERSION'
-hook="'$(printf "{\"hook\": \"SSH\", \"value\": {\"socket_path\": \"'$control_path'\", \"remote_shell\": \"%s\", \"session_id\": '"$WARP_SESSION_ID"', \"remote_session_id\": '"$remote_session_id"', \"external_control_master\": '"$external_control_master"'}}" "${SHELL##*/}" | command od -An -v -tx1 | command tr -d " \n")'"
+hook="'$(printf "{\"hook\": \"SSH\", \"value\": {\"socket_path\": \"'$control_path'\", \"remote_shell\": \"%s\", \"session_id\": '"$WARP_SESSION_ID"', \"remote_session_id\": '"$remote_session_id"', \"external_control_master\": '"$external_control_master"', \"persist\": '"$persist"'}}" "${SHELL##*/}" | command od -An -v -tx1 | command tr -d " \n")'"
 printf '$DCS_START$DCS_JSON_MARKER%s$DCS_END' "'$hook'"
 
 if test "'"${SHELL##*/}" != "bash" -a "${SHELL##*/}" != "zsh"'"; then

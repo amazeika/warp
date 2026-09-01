@@ -258,6 +258,7 @@ fn ssh_hook_round_trips_through_serialization() {
             session_id: Some(3),
             remote_session_id: Some(4),
             external_control_master: true,
+            persist: true,
         },
     };
     let json = serde_json::to_string(&hook).unwrap();
@@ -269,6 +270,7 @@ fn ssh_hook_round_trips_through_serialization() {
     assert_eq!(value.session_id, Some(3));
     assert_eq!(value.remote_session_id, Some(4));
     assert!(value.external_control_master);
+    assert!(value.persist);
 }
 
 #[test]

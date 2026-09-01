@@ -370,6 +370,19 @@ fn build_host_shell_command(
         if reuse_ssh_control_master { "1" } else { "0" },
     );
 
+    // Whether a Warp-owned ControlMaster should outlive the foreground `ssh`
+    // that created it. Only meaningful with the feature on: it changes the
+    // lifetime of every Warp SSH connection, so with the flag off the wrapper
+    // must emit exactly what it emitted before this feature existed.
+    builder.env(
+        "WARP_SSH_CONTROL_PERSIST",
+        if FeatureFlag::CloneSshOnSplit.is_enabled() {
+            "1"
+        } else {
+            "0"
+        },
+    );
+
     // For integration tests, put SSH control master sockets under the actual
     // home directory, as the length of the path to sockets placed in the
     // integration test home directory can exceed length limits.
@@ -886,6 +899,14 @@ fn build_docker_sandbox_command(
     builder.env(
         "WARP_SSH_REUSE_CONTROL_MASTER",
         if reuse_ssh_control_master { "1" } else { "0" },
+    );
+    builder.env(
+        "WARP_SSH_CONTROL_PERSIST",
+        if FeatureFlag::CloneSshOnSplit.is_enabled() {
+            "1"
+        } else {
+            "0"
+        },
     );
     builder.env("SSH_SOCKET_DIR", ssh_socket_dir());
     builder.env("WARP_IS_LOCAL_SHELL_SESSION", "1");
