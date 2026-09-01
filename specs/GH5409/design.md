@@ -3,7 +3,7 @@ status: in-progress
 issue: 5409
 tracking: amazeika/warp#1
 pr: null
-completed: [1, 2]
+completed: [1, 2, 3]
 ---
 
 # Reuse the SSH connection when splitting a pane — Design Document
@@ -455,12 +455,18 @@ the phase.
 **ID:** `3`
 **Goal:** the app can ask a terminal view for the `ssh` command that created its *current* remote
 session, with no risk of returning a stale or inner-session command
-**Tests:** pending
+**Tests:** `app/src/terminal/warpify/trigger_state_tests.rs`
 
 **Acceptance criteria:**
 
-- [ ] The `(SessionId, command)` pair is recorded when a `WarpifiedRemote` session starts.
-- [ ] It is not recorded for local subshell warpification.
+- [ ] The `(SessionId, command)` pair is recorded when a `WarpifiedRemote` session established by
+      the SSH wrapper starts. The command is the pending, alias-expanded one that already passed
+      `parse_interactive_ssh_command`, per §2's verbatim-replay reasoning — not the block text as
+      typed.
+- [ ] Nothing is recorded when that validated command is absent.
+- [ ] It is not recorded for a session the wrapper did not establish — a local subshell, or a
+      subshell warpified on the remote host or in a container, all of which reach the same
+      bootstrap path.
 - [ ] The accessor returns `None` when the bound session id does not match
       `active_block_session_id()`.
 - [ ] Running a non-warpifying `ssh` inside a remote session does not change what the accessor
@@ -470,9 +476,30 @@ session, with no risk of returning a stale or inner-session command
 **Steps:**
 
 1. Store the bound pair in `WarpifyState` ([trigger_state.rs](../../app/src/terminal/warpify/trigger_state.rs)),
-   set from `on_warpify_start` and guarded on session type.
-2. Clear it where `pending_state` is taken in `get_completed_warpify_session_id`.
+   sourced from its own pending command and guarded on session type and wrapper origin.
+2. Release it when the session ends, and again when the pane's local shell exits.
 3. Expose a validating accessor on `TerminalView`.
+
+**Delivered.** Three deviations from the phase as first written, each forced by evidence:
+
+- **The write site moved.** The plan bound from `add_bootstrap_success_block`, which runs only for
+  sessions carrying `subshell_info`. A wrapper-established SSH session has none — its remote
+  `InitShell` payload sends no `is_subshell` — so that site never runs on the path Phase 4 needs.
+  The binding is made in `handle_session_bootstrapped`, keyed on the bootstrap event's own
+  `session_id` rather than `active_block_session_id()`.
+- **Binding requires wrapper origin, not just a remote session type.** `determine_session_type`
+  decides the type by comparing hostnames, so a subshell warpified on the remote host or in a
+  container is typed `WarpifiedRemote` too. Binding on type alone let such a subshell overwrite the
+  outer session's command and hand out a non-`ssh` string. The guard is
+  `IsSSHWrapperSession::Yes`, which is what Phase 4 requires anyway.
+- **Release is not on the local completion path.** Step 2 originally cleared the binding in
+  `get_completed_warpify_session_id`, which only fires for subshell-warpified sessions and so never
+  for wrapper SSH. Release is on `ExitShell`, with the pane's local shell exiting as the backstop
+  for the abrupt-close case where that remote hook never arrives.
+
+An Open Question added mid-phase — which form of the `ssh` command to bind — was withdrawn rather
+than carried: §2's verbatim-replay reasoning had already settled it, and the implementation now
+follows it.
 
 ### Phase 4: Open the split pane on the source pane's connection
 

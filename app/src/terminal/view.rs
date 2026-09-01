@@ -9202,6 +9202,14 @@ impl TerminalView {
         self.warpify_state.get_pending_ssh_host().is_some() && self.is_long_running()
     }
 
+    /// The `ssh` command that started this view's *current* Warpified remote session, or `None`
+    /// when the active session is local, or is not the one that command started. A split re-runs
+    /// it to reach the same host over the connection that session already holds.
+    pub fn bound_ssh_command(&self) -> Option<&str> {
+        self.warpify_state
+            .bound_ssh_command(self.active_block_session_id())
+    }
+
     /// Like `is_long_running`, but also requires the user to be in control of the command
     /// (i.e. the user ran it, or took it over from the agent). Returns `false` for commands
     /// that are currently being driven by the agent.
@@ -11831,6 +11839,11 @@ impl TerminalView {
                 ctx.request_user_attention();
             }
             ModelEvent::Exit { reason } => {
+                // `ExitShell` is a remote hook, so a dropped connection or an abruptly killed
+                // remote shell never delivers it. The local shell exiting is the backstop: by
+                // then no session of this pane can still be attached.
+                self.warpify_state.release_bound_ssh_command();
+
                 if !self.manual_pty_shutdown_requested
                     && let Some((conversation_id, command)) =
                         self.maybe_send_agent_exited_shell_telemetry(ctx)
@@ -12954,6 +12967,8 @@ impl TerminalView {
                 }
             }
             ModelEvent::ExitShell { session_id } => {
+                self.warpify_state.release_ssh_command(*session_id);
+
                 // Drop the remote server client for this session before the
                 // user's outer ssh tunnel starts closing. The last
                 // `Arc<RemoteServerClient>` carries an owned `Child` for the
@@ -13713,6 +13728,7 @@ impl TerminalView {
         }
 
         let is_subshell_or_ssh = session.is_subshell_or_ssh();
+        let is_ssh_wrapper_session = session.is_ssh_wrapper_session();
 
         // Make sure we decorate any text that is already in the input.  We
         // need to make sure external commands have finished loading before
@@ -13744,6 +13760,15 @@ impl TerminalView {
 
         // If we were waiting for a successful warpification, it's come. Stop the timeout.
         self.warpify_state.abort_ssh_warpify_timeout();
+
+        // Bind here rather than in `add_bootstrap_success_block`: that runs only for sessions
+        // carrying `subshell_info`, and a wrapper-established SSH session has none — its remote
+        // `InitShell` payload sends no `is_subshell`.
+        self.warpify_state.bind_ssh_command(
+            session_id,
+            &bootstrap_event.session_type,
+            is_ssh_wrapper_session,
+        );
 
         let is_warpified_remote = matches!(
             bootstrap_event.session_type,
