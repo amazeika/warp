@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: shipped
 issue: 5409
 tracking: amazeika/warp#1
 pr: null
