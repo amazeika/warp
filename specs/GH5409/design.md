@@ -821,7 +821,8 @@ Deviations from the phase as planned, all traced to the pre-implementation chall
   ControlPersist clause was already satisfied at pane spawn by Phase 2's flag gate
   ([unix.rs:379](../../crates/warp_terminal/src/local_tty/unix.rs#L379)). The setting is read at
   split time, so it could never retroactively change the lifetime of a master a pane already holds.
-  Nothing in this phase was needed for that clause.
+  Nothing in this phase was needed for that clause. *Reversed in Phase 12*, which gates the variable
+  at pane spawn instead, where the setting can reach it.
 
 Scope added during the phase: one acceptance criterion (honest success reporting), three declared
 test gates (`app/src/settings/ssh_tests.rs`, `app/src/settings_view/warpify_page_tests.rs`,
@@ -969,6 +970,64 @@ review ran with two of three tracks; the Grok track was unavailable for billing 
 - [ ] The union of test paths declared by completed phases, including Phase 10's, passes.
 - [ ] Failures surfaced by the sweep are remediated in this phase.
 
+### Phase 12: Release a closed window's sessions, and tie `ControlPersist` to the setting
+
+**ID:** `12`
+**Goal:** a Warp-owned master stops outliving its visible use in the two cases Phase 10 left — the
+panes of a closed window, and a user who declined the feature entirely
+**Tests:** `app/src/workspace/view_tests.rs`, `app/src/undo_close/stack_tests.rs`,
+`app/src/terminal/view_tests.rs`, `crates/warp_terminal/src/local_tty/unix_tests.rs`,
+`crates/warp_terminal/src/local_tty/windows/environment_tests.rs`
+
+This phase carries two changes that share a rationale — a master outliving the use that justified
+it — but not a mechanism. One is a view-lifecycle contract spanning `workspace`, `undo_close`, and
+`remote_server`; the other is environment plumbing. They are kept separate below, in their criteria,
+and in their tests. If the lifecycle half needs to grow, it should split back out rather than drag
+the plumbing with it.
+
+**Acceptance criteria — closed windows:**
+
+- [ ] Closing a window releases the remote-server clients of every warpified SSH session its panes
+      started, once that window can no longer be restored.
+- [ ] Undoing a window close releases nothing: the restored panes keep their connections and remain
+      usable.
+- [ ] The release happens both when undo-close is enabled, where the window's entry discards on
+      expiry, and when it is disabled, where `push_item` discards immediately.
+- [ ] The release is driven from state captured while the window is still live, since after
+      `handle_window_closed` the window is absent from `AppContext::windows` and its views are
+      unreachable through `views_of_type` and `is_window_open`.
+- [ ] Releasing twice is harmless: a pane whose tab already released under Phase 10, in a window
+      that then closes, releases once and reports no error.
+- [ ] A window closing during application termination is left alone — `on_window_will_close` already
+      returns early there, and process exit drops the proxies — and this phase adds no error on
+      that path.
+
+**Acceptance criteria — `ControlPersist` and the setting:**
+
+- [ ] `WARP_SSH_CONTROL_PERSIST` is `1` only when the `CloneSshOnSplit` flag and the
+      `clone_ssh_on_split` setting are both on, and `0` otherwise.
+- [ ] With the setting off, the wrapper environment is byte-identical to what it was before this
+      feature existed.
+- [ ] The unix and Windows spawn paths derive the value from the same `PtyOptions` field, so they
+      cannot drift apart.
+
+Reverses the Phase 6 decision "the setting deliberately does not reach `WARP_SSH_CONTROL_PERSIST`".
+That decision was right about mechanism — the setting is read at split time and cannot retroactively
+change a master a pane already holds — but it left the cost recorded in Open Questions: a user who
+declined the feature still paid for every lingering authenticated master. Gating at spawn is what
+that reasoning missed.
+
+### Phase 13: Full test sweep after the window-close fix
+
+**ID:** `13`
+**Goal:** the union of declared tests is green again on the Phase 12 tree
+**Tests:** all
+
+**Acceptance criteria:**
+
+- [ ] The union of test paths declared by completed phases, including Phase 12's, passes.
+- [ ] Failures surfaced by the sweep are remediated in this phase.
+
 ### Phase 8: Outcome
 
 **ID:** `8`
@@ -998,6 +1057,10 @@ exists for.
 - [ ] In a split pane, log out, then `ssh` a *different* host → lands on that host, not the first.
 - [ ] Close the origin pane → the other panes stay alive and usable.
 - [ ] Close every pane → the master is reaped after the idle timeout.
+- [ ] Close the *window* holding the SSH panes → the master is reaped after the idle timeout.
+- [ ] Close that window and undo the close → the restored panes are still on the same connection.
+- [ ] With `clone_ssh_on_split` off, split → a local pane as before, and the master is reaped after
+      the foreground `ssh` exits rather than lingering.
 - [ ] At a password prompt → split → local pane, no prompt storm.
 - [ ] `ssh host ls` (exits) → split → local pane.
 - [ ] Session warpified by the RC snippet rather than the wrapper → split → local pane.
@@ -1019,11 +1082,12 @@ exists for.
   split-then-close ordering keeps the connection, short enough to bound how long an authenticated
   session lingers past visible use.
 - **Should the source pane's local launch directory be snapshotted for the new pane's local PTY?**
-  Attaching needs no credentials, so relative `-i`/`-F` no longer matter and this is now cosmetic —
-  the local PTY is a thin shell that immediately enters SSH. Deferred unless verification shows it
-  matters.
-- **New tab and new window from an SSH pane.** Out of scope here; the Phase 4 helper is written so
-  this is a small follow-up.
+  *Resolved: no.* Attaching needs no credentials, so relative `-i`/`-F` no longer matter, and the
+  local PTY is a thin shell that immediately enters SSH. Nothing observable depends on its
+  directory, and verification never raised it. Closed rather than deferred — there is no behavior
+  here to come back to.
+- **New tab and new window from an SSH pane.** *Deferred to a follow-up issue.* Out of scope here;
+  the Phase 4 helper is written so this is a small follow-up.
 - **Should opting out of the split also stop `ControlPersist`?** Raised by review in Phase 6. With
   the flag on and `clone_ssh_on_split` off, every Warp-owned master still gets `ControlPersist=60`,
   because `WARP_SSH_CONTROL_PERSIST` is read at pane spawn from the flag alone
@@ -1031,9 +1095,25 @@ exists for.
   declined the only feature that consumes those lingering masters still pay for them. This meets
   Phase 6's fourth criterion, which deliberately ties the lifetime change to the flag, and the
   spawn-time read is the same shape `reuse_existing_control_master` already uses, so ANDing the
-  setting in is feasible. **Settle before the flag promotes to Stable**, not in this spec.
-- **Windows/WSL.** Whether the wrapper attach path is reachable and correct there is unexamined
-  beyond the same-distro constraint recorded in Phase 4.
+  setting in is feasible.
+  *Resolved in Phase 12: the setting gates the lifetime too.* Investigation found the change smaller
+  than this question assumed. `clone_ssh_on_split` is not plumbed into `PtyOptions` at all today —
+  the existing `reuse_ssh_control_master` field carries the *other*, pre-existing setting
+  ([terminal_manager.rs:852](../../app/src/terminal/local_tty/terminal_manager.rs#L852)) — so the
+  work is one new field feeding the two places that compute the variable
+  ([unix.rs:379](../../crates/warp_terminal/src/local_tty/unix.rs#L379),
+  [environment.rs:113](../../crates/warp_terminal/src/local_tty/windows/environment.rs#L113)).
+  The accepted cost is that a pane spawned before the setting was turned on reports
+  `persist: false`, so Phase 4's gate declines the attach and the split degrades to a fresh
+  connection until that pane is respawned — the same degradation the flag-flip case already has,
+  and Phase 4 already handles it without breaking anything.
+- **Windows/WSL.** *Reachability confirmed; correctness still unverified.* All three wrapper
+  variables exist on the Windows side, and `WARP_SSH_ATTACH_CONTROL_PATH` is on the `WSLENV`
+  forward allowlist
+  ([environment.rs:236](../../crates/warp_terminal/src/local_tty/windows/environment.rs#L236)), so
+  the attach path is plumbed rather than absent. What remains is empirical: whether it behaves
+  correctly on a real Windows/WSL host, beyond the same-distro constraint recorded in Phase 4. That
+  needs hardware this spec was not developed on. *Deferred to a follow-up verification issue.*
 - **Does `ControlPersist` need a last-client check after all?** Section 2 rejected an
   attached-client check before teardown as "reintroduces refcount bookkeeping", on the premise that
   the idle timeout reaps a master Warp stops force-exiting. Two independent reviews of Phase 2
@@ -1081,18 +1161,39 @@ exists for.
   idle timeout. The second bullet was already settled in Phase 4 by gating the attach on the source
   master's reported persistence.
 - **Does closing a window release its panes' SSH sessions?** Raised by review in Phase 10 and left
-  open there. Phase 10 closes the tab paths: a tab dropped without an undo entry now detaches
-  `Closed` and releases. Window close was not traced end to end. The concern is that closing a
-  window may detach its panes reversibly and then discard the window, leaving any undo entries
-  unable to expire — and `clean_up_panes`, the only whole-tab `Closed` sender, runs only on that
-  expiry ([stack.rs:148](../../app/src/undo_close/stack.rs#L148)). If so, a window closed with a
-  warpified SSH pane keeps that master authenticated until Warp exits. This is not a regression —
-  the same path leaked before Phase 10, when nothing released at all — but it is the last known gap
-  in the phase's goal. **Settle before the flag promotes to Stable.**
+  open there, because window close had not been traced end to end. *Resolved: it does not. Fixed in
+  Phase 12.* The trace found two independent guards, each of which alone is enough to skip the
+  release:
+  - `Workspace::on_window_closed` ([view.rs:27872](../../app/src/workspace/view.rs#L27872)) walks
+    every tab's pane group and detaches as `HiddenForClose`
+    ([mod.rs:7987](../../app/src/pane_group/mod.rs#L7987)) — reversible, so nothing is released.
+    That is correct on its own terms: the window may come back through undo.
+  - The window is then removed outright — `handle_window_closed` does
+    `self.windows.remove(&window_id)` and moves the `Window` into `ClosedWindowData`
+    ([app.rs:4704](../../crates/warpui_core/src/core/app.rs#L4704)). So when the undo entry
+    discards, `ClosedItem::Window::discard` ([stack.rs:75](../../app/src/undo_close/stack.rs#L75))
+    resolves the workspace through `views_of_type`, which indexes `self.windows` and returns
+    `None`. Even if it resolved, `clean_up_pane_group` early-returns on `!ctx.is_window_open`
+    ([stack.rs:143](../../app/src/undo_close/stack.rs#L143)).
+
+  The panes' views stay alive inside `ClosedWindowData`, and `Drop for TerminalView` only sends
+  telemetry — it has no release path. This holds whether undo-close is enabled (discard on expiry)
+  or disabled (`push_item` discards immediately). So a window closed with a warpified SSH pane keeps
+  its remote-server proxy attached, the master's idle timer never starts, and the connection stays
+  authenticated until Warp exits.
+
+  One correction to how this question was originally posed: it supposed the undo entries would be
+  "unable to expire". They do expire on schedule; the discard they run is simply a no-op.
+
+  Not a regression — the same path leaked before Phase 10, when nothing released at all — but it was
+  the last gap in that phase's goal, so Phase 12 closes it rather than deferring it to Stable.
 
 - **`sshd` `MaxSessions` budget.** Each split consumes an interactive channel plus a
   remote-server-proxy channel, so the default budget of 10 allows fewer splits than it appears.
-  Whether to surface a specific message at the limit, or simply fail visibly, is unsettled.
+  *Resolved: fail visibly, with no special-casing.* A dedicated message would have to recognise a
+  server-side refusal that `ssh` reports generically, and the failure is already visible in the new
+  pane. *A specific message is deferred to a follow-up issue* if the generic failure proves
+  confusing in practice.
 
 ## Outcome
 
