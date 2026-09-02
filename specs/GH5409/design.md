@@ -3,7 +3,7 @@ status: in-progress
 issue: 5409
 tracking: amazeika/warp#1
 pr: null
-completed: [1, 2, 3, 4, 5, 6]
+completed: [1, 2, 3, 4, 5, 6, 7]
 ---
 
 # Reuse the SSH connection when splitting a pane — Design Document
