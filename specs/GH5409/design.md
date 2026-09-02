@@ -3,7 +3,7 @@ status: in-progress
 issue: 5409
 tracking: amazeika/warp#1
 pr: null
-completed: [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13]
+completed: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
 ---
 
 # Reuse the SSH connection when splitting a pane — Design Document
@@ -841,8 +841,8 @@ it lands when the PR is opened.
 
 **Acceptance criteria:**
 
-- [ ] The union of test paths declared by completed phases passes through the scoped resolver.
-- [ ] Failures surfaced by the sweep are remediated in this phase.
+- [x] The union of test paths declared by completed phases passes through the scoped resolver.
+- [x] Failures surfaced by the sweep are remediated in this phase.
 
 ### Phase 10: Release the remote-server proxy when a pane goes away
 
@@ -967,8 +967,8 @@ review ran with two of three tracks; the Grok track was unavailable for billing 
 
 **Acceptance criteria:**
 
-- [ ] The union of test paths declared by completed phases, including Phase 10's, passes.
-- [ ] Failures surfaced by the sweep are remediated in this phase.
+- [x] The union of test paths declared by completed phases, including Phase 10's, passes.
+- [x] Failures surfaced by the sweep are remediated in this phase.
 
 ### Phase 12: Release a closed window's sessions, and tie `ControlPersist` to the setting
 
@@ -1079,8 +1079,8 @@ that reasoning missed.
 
 **Acceptance criteria:**
 
-- [ ] The union of test paths declared by completed phases, including Phase 12's, passes.
-- [ ] Failures surfaced by the sweep are remediated in this phase.
+- [x] The union of test paths declared by completed phases, including Phase 12's, passes.
+- [x] Failures surfaced by the sweep are remediated in this phase.
 
 ### Phase 8: Outcome
 
@@ -1126,6 +1126,48 @@ exists for.
 - [ ] Full-screen TUI (`vim`, `htop`) running over SSH → split → still works.
 - [ ] Split from an editor pane beside an SSH pane → no clone.
 - [ ] `./script/presubmit` passes; a narrated screen recording is captured for the upstream PR.
+
+### Running the declared tests
+
+Every test file named by a phase above runs through `cargo nextest`, which selects by test name
+rather than by path, so each file needs its own filter. The shape is the same for all of them:
+
+```bash
+cargo nextest run -p <package> --no-fail-fast -E '<filter>'
+```
+
+Every `app/src/**` row additionally passes `--lib`, since those tests live in the `warp` binary
+crate's lib target.
+
+| Test file | Package | `-E` filter | Tests |
+| --- | --- | --- | --- |
+| `crates/integration/src/test/ssh_control_master_attach.rs` | `integration` | `test(/test_ssh_wrapper_attach_/)` | 4 |
+| `crates/integration/src/test/ssh_control_persist.rs` | `integration` | `test(/test_ssh_wrapper_persist_/)` | 3 |
+| `crates/remote_server/src/ssh_tests.rs` | `remote_server` | `test(/^ssh::tests::/)` | 5 |
+| `crates/remote_server/src/manager_tests.rs` | `remote_server` | `test(/^manager::tests::/)` | 9 |
+| `crates/warp_terminal/src/local_tty/unix_tests.rs` | `warp_terminal` | `test(/^local_tty::unix::tests::/)` | 6 |
+| `crates/warp_terminal/src/model/ansi/mod_tests.rs` | `warp_terminal` | `test(/^model::ansi::tests::/)` | 76 |
+| `crates/warp_terminal/src/model/ansi/dcs_hooks_tests.rs` | `warp_terminal` | `test(/^model::ansi::dcs_hooks::tests::/)` | 13 |
+| `app/src/terminal/warpify/trigger_state_tests.rs` | `warp` | `test(/^terminal::warpify::trigger_state::tests::/)` | 14 |
+| `app/src/terminal/ssh/clone_on_split_tests.rs` | `warp` | `test(/^terminal::ssh::clone_on_split::tests::/)` | 22 |
+| `app/src/terminal/ssh/util_tests.rs` | `warp` | `test(/^terminal::ssh::util::tests::/)` | 8 |
+| `app/src/terminal/view_tests.rs` | `warp` | `test(/^terminal::view::tests::/)` | 186 |
+| `crates/warp_terminal/src/shell/mod_tests.rs` | `warp_terminal` | `test(/^shell::tests::/)` | 23 |
+| `app/src/pane_group/mod_tests.rs` | `warp` | `test(/^pane_group::tests::/)` | 62 |
+| `app/src/workspace/view_tests.rs` | `warp` | `test(/^workspace::view::tests::/)` | 96 |
+| `app/src/undo_close/stack_tests.rs` | `warp` | `test(/^undo_close::stack::tests::/)` | 7 |
+| `app/src/settings/ssh_tests.rs` | `warp` | `test(/^settings::ssh::tests::/)` | 5 |
+| `app/src/settings_view/warpify_page_tests.rs` | `warp` | `test(/^settings_view::warpify_page::tests::/)` | 3 |
+| `app/src/terminal/model/session_tests.rs` | `warp` | `test(/^terminal::model::session::test::/)` | 10 |
+
+That is 552 tests across 18 commands, and it is exactly what the Phase 13 sweep ran.
+
+Two caveats for anyone reproducing this. The two `crates/integration` rows never dial a host: they
+fail closed inside the SSH wrapper first, which is why they run offline — nothing in this suite
+completes a real SSH handshake, so the manual checklist above remains the only evidence for the
+no-second-prompt claim. And `./script/presubmit` runs `cargo nextest run --workspace`, which
+includes integration tests that tunnel to Warp's private GCP project; those cannot pass without
+credentials for it, so presubmit is not runnable outside Warp's own environment.
 
 ## 5. Open Questions
 
