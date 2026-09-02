@@ -197,6 +197,7 @@ use super::model::secrets::RichContentSecretTooltipInfo;
 use super::model::selection::ExpandedSelectionRange;
 use super::model::session::SessionBootstrappedEvent;
 use super::settings::AltScreenPaddingMode;
+use super::ssh::clone_on_split::SshCloneFacts;
 use super::ssh::util::{InteractiveSshCommand, SshWarpifyCommand, parse_interactive_ssh_command};
 use super::warpify::WarpificationSource;
 use super::warpify::success_block::{WarpifySuccessBlock, WarpifySuccessBlockEvent};
@@ -9208,6 +9209,32 @@ impl TerminalView {
     pub fn bound_ssh_command(&self) -> Option<&str> {
         self.warpify_state
             .bound_ssh_command(self.active_block_session_id())
+    }
+
+    /// Everything a split needs to know about this view's active session to decide whether it may
+    /// join that session's SSH connection, or `None` when there is no active session. Assembling
+    /// it here keeps the decision itself a plain function of the facts.
+    pub fn ssh_clone_source<C: ModelAsRef>(&self, ctx: &C) -> Option<SshCloneFacts> {
+        let session = self
+            .sessions
+            .as_ref(ctx)
+            .get(self.active_block_session_id()?)?;
+        // The distro comes from this pane's own shell, not from the session: the ControlMaster
+        // socket lives beside the local `ssh` that opened it, and a warpified remote session
+        // reports no distro at all — its `wsl_name` carries the remote host's answer, which is
+        // always absent for a Linux box.
+        let wsl_distro = self
+            .model
+            .lock()
+            .shell_launch_state()
+            .available_shell()
+            .and_then(|shell| shell.wsl_distro());
+        Some(SshCloneFacts {
+            session_type: session.session_type(),
+            wrapper: session.ssh_wrapper_session().clone(),
+            bound_command: self.bound_ssh_command().map(str::to_owned),
+            wsl_distro,
+        })
     }
 
     /// Like `is_long_running`, but also requires the user to be in control of the command

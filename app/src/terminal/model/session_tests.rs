@@ -6,7 +6,10 @@ use warpui::platform::WindowStyle;
 use warpui::{App, AppContext, Element, Entity, ModelHandle, TypedActionView, View, ViewContext};
 
 use super::command_executor::testing::TestCommandExecutor;
-use super::{BootstrapSessionType, Session, SessionId, SessionInfo, Sessions, SessionsEvent};
+use super::{
+    BootstrapSessionType, Session, SessionId, SessionInfo, Sessions, SessionsEvent,
+    is_supported_control_path,
+};
 
 struct TestView {
     events: Vec<SessionsEvent>,
@@ -173,4 +176,60 @@ fn powershell_read_command_embeds_escaped_path_without_args() {
         command,
         OsString::from(r"[System.IO.File]::ReadAllText('C:\o''brien\history.txt')")
     );
+}
+
+/// The wrapper builds this path itself, but it reaches us only after the *remote* host echoes it
+/// back in the SSH hook JSON, so the shape it left with is the shape it must come back with.
+///
+/// The tilde form is the one that actually arrives: `SSH_SOCKET_DIR` is the literal `~/.ssh`
+/// outside the integration channel, and the wrapper interpolates it inside double quotes, so
+/// nothing expands it before `ssh` does. Rejecting it would downgrade every wrapper-established
+/// session to `IsSSHWrapperSession::No`, taking the remote-server proxy and master teardown with
+/// it.
+#[test]
+fn accepts_the_tilde_prefixed_path_the_wrapper_actually_emits() {
+    assert!(is_supported_control_path(std::path::Path::new(
+        "~/.ssh/9f3c1e2a"
+    )));
+}
+
+/// The integration channel resolves `SSH_SOCKET_DIR` from `ORIGINAL_HOME`, so the path is rooted
+/// there.
+#[test]
+fn accepts_a_rooted_control_path() {
+    assert!(is_supported_control_path(std::path::Path::new(
+        "/Users/somebody/.ssh/9f3c1e2a"
+    )));
+}
+
+#[test]
+fn rejects_a_control_path_that_escapes_its_directory() {
+    assert!(!is_supported_control_path(std::path::Path::new(
+        "/Users/somebody/.ssh/../../../tmp/attacker"
+    )));
+}
+
+/// A relative path would resolve against whatever directory the pane happens to start in.
+#[test]
+fn rejects_a_relative_control_path() {
+    assert!(!is_supported_control_path(std::path::Path::new(
+        ".ssh/9f3c1e2a"
+    )));
+}
+
+/// Characters outside the wrapper's own filter mean the value did not survive the round trip; a
+/// quote or a space would also break the hook JSON it is interpolated into.
+#[test]
+fn rejects_a_control_path_with_characters_the_wrapper_filters_out() {
+    assert!(!is_supported_control_path(std::path::Path::new(
+        "/Users/somebody/.ssh/id\" ssh other-host"
+    )));
+    assert!(!is_supported_control_path(std::path::Path::new(
+        "/Users/somebody/.ssh/two words"
+    )));
+}
+
+#[test]
+fn rejects_an_empty_control_path() {
+    assert!(!is_supported_control_path(std::path::Path::new("")));
 }

@@ -143,6 +143,9 @@ use crate::terminal::shared_session::share_modal::{ShareSessionModal, ShareSessi
 use crate::terminal::shared_session::{
     self, IsSharedSessionCreator, SharedSessionActionSource, SharedSessionSource,
 };
+use crate::terminal::ssh::clone_on_split::{
+    ATTACH_CONTROL_PATH_ENV, SshCloneRequest, clone_request,
+};
 use crate::terminal::view::inline_banner::{
     ZeroStatePromptSuggestionTriggeredFrom, ZeroStatePromptSuggestionType,
 };
@@ -3962,6 +3965,66 @@ impl PaneGroup {
         new_pane_id
     }
 
+    /// Splits `base_pane_id` because the user asked for a split.
+    ///
+    /// Every user-initiated split routes through here — the pane-group bindings and the
+    /// terminal's own `PaneEvent::Split*` alike — because this is the only boundary that carries
+    /// that intent, and therefore the only one that may attach the new pane to the source pane's
+    /// SSH connection. `add_terminal_pane` and `insert_terminal_pane` create panes for the LSP log
+    /// viewer, the file uploader, workflows, plugin instructions and third-party conversations;
+    /// each installs its own command into the new pane, so attaching there would both clobber that
+    /// command and reach a host the caller never asked for.
+    pub fn split_terminal_pane(
+        &mut self,
+        direction: Direction,
+        base_pane_id: PaneId,
+        chosen_shell: Option<AvailableShell>,
+        ctx: &mut ViewContext<Self>,
+    ) -> TerminalPaneId {
+        let clone_request = self.ssh_clone_request(base_pane_id, chosen_shell.as_ref(), ctx);
+        let base_session_id = base_pane_id
+            .as_terminal_pane_id()
+            .or(self.active_session_id(ctx));
+        let new_pane_id = self.add_session_with_default_session_mode_behavior(
+            direction,
+            Some(base_pane_id),
+            base_session_id,
+            chosen_shell,
+            None, /* conversation_restoration */
+            DefaultSessionModeBehavior::Apply,
+            clone_request,
+            ctx,
+        );
+        ctx.emit(Event::AppStateChanged);
+        new_pane_id
+    }
+
+    /// Whether a split of `source_pane_id` may join that pane's SSH connection, and with what.
+    ///
+    /// Resolved from the pane actually being split, never from the active session: those diverge
+    /// whenever a non-terminal pane holds focus, and reading the active session there would clone
+    /// a connection belonging to a pane the user did not split. A non-terminal source yields no
+    /// terminal view and so no request.
+    fn ssh_clone_request(
+        &self,
+        source_pane_id: PaneId,
+        chosen_shell: Option<&AvailableShell>,
+        ctx: &ViewContext<Self>,
+    ) -> Option<SshCloneRequest> {
+        let source = self
+            .terminal_view_from_pane_id(source_pane_id, ctx)?
+            .as_ref(ctx)
+            .ssh_clone_source(ctx)?;
+        // The new pane spawns the shell chosen for it, so that shell's distro is the distro the
+        // socket would have to be reachable from.
+        let target_wsl_distro = chosen_shell.and_then(AvailableShell::wsl_distro);
+        clone_request(
+            &source,
+            target_wsl_distro.as_deref(),
+            FeatureFlag::CloneSshOnSplit.is_enabled(),
+        )
+    }
+
     /// Adds a terminal split pane without applying the user's default session mode.
     pub fn add_terminal_pane_ignoring_default_session_mode(
         &mut self,
@@ -3976,13 +4039,17 @@ impl PaneGroup {
             chosen_shell,
             None, /* conversation_restoration */
             DefaultSessionModeBehavior::Ignore,
+            None, /* ssh_clone_request */
             ctx,
         );
         ctx.emit(Event::AppStateChanged);
         new_pane_id
     }
 
-    /// Used when splitting panes.
+    /// Creates a terminal pane beside `base_pane_id` for a caller that is not a user-initiated
+    /// split — today the `CopyFileToRemote` uploader, which hides the pane and installs its own
+    /// command. Never attaches to the source pane's SSH connection; `split_terminal_pane` is the
+    /// path that may.
     fn insert_terminal_pane(
         &mut self,
         direction: Direction,
@@ -5185,16 +5252,16 @@ impl PaneGroup {
             // we may revisit this so that splitting from a terminal pane starts a new session, but
             // splitting from a notebook pane reopens the notebook side-by-side.
             PaneEvent::SplitLeft(chosen_shell) => {
-                self.insert_terminal_pane(Direction::Left, pane_id, chosen_shell.clone(), ctx);
+                self.split_terminal_pane(Direction::Left, pane_id, chosen_shell.clone(), ctx);
             }
             PaneEvent::SplitRight(chosen_shell) => {
-                self.insert_terminal_pane(Direction::Right, pane_id, chosen_shell.clone(), ctx);
+                self.split_terminal_pane(Direction::Right, pane_id, chosen_shell.clone(), ctx);
             }
             PaneEvent::SplitUp(chosen_shell) => {
-                self.insert_terminal_pane(Direction::Up, pane_id, chosen_shell.clone(), ctx);
+                self.split_terminal_pane(Direction::Up, pane_id, chosen_shell.clone(), ctx);
             }
             PaneEvent::SplitDown(chosen_shell) => {
-                self.insert_terminal_pane(Direction::Down, pane_id, chosen_shell.clone(), ctx);
+                self.split_terminal_pane(Direction::Down, pane_id, chosen_shell.clone(), ctx);
             }
             PaneEvent::ToggleMaximized => {
                 // The toggled pane might not be the active pane -- focus it first.
@@ -6629,6 +6696,7 @@ impl PaneGroup {
             chosen_shell,
             conversation_restoration,
             DefaultSessionModeBehavior::Apply,
+            None, /* ssh_clone_request */
             ctx,
         )
     }
@@ -6642,8 +6710,25 @@ impl PaneGroup {
         chosen_shell: Option<AvailableShell>,
         conversation_restoration: Option<ConversationRestorationInNewPaneType>,
         default_session_mode_behavior: DefaultSessionModeBehavior,
+        ssh_clone_request: Option<SshCloneRequest>,
         ctx: &mut ViewContext<Self>,
     ) -> TerminalPaneId {
+        // A cloned pane's local shell exists only to enter SSH, so a local startup directory
+        // would never be visible. Resolving one anyway would consult `WorkingDirectoryConfig`
+        // for a session that is not local.
+        if ssh_clone_request.is_some() {
+            return self.add_session_in_directory(
+                direction,
+                base_pane_id_for_split,
+                chosen_shell,
+                None, /* startup_directory */
+                conversation_restoration,
+                default_session_mode_behavior,
+                ssh_clone_request,
+                ctx,
+            );
+        }
+
         // If restoring a conversation, use its startup working directory if it exists.
         // For forks this is the conversation's latest working directory so the
         // fork continues where the source conversation left off.
@@ -6677,6 +6762,7 @@ impl PaneGroup {
             startup_directory,
             conversation_restoration,
             default_session_mode_behavior,
+            ssh_clone_request,
             ctx,
         )
     }
@@ -6739,6 +6825,7 @@ impl PaneGroup {
         startup_directory: Option<PathBuf>,
         conversation_restoration: Option<ConversationRestorationInNewPaneType>,
         default_session_mode_behavior: DefaultSessionModeBehavior,
+        ssh_clone_request: Option<SshCloneRequest>,
         ctx: &mut ViewContext<Self>,
     ) -> TerminalPaneId {
         let should_immediately_enter_agent_view = matches!(
@@ -6747,9 +6834,18 @@ impl PaneGroup {
         ) && conversation_restoration.is_none()
             && AISettings::as_ref(ctx).default_session_mode(ctx) == DefaultSessionMode::Agent;
 
+        let is_ssh_clone = ssh_clone_request.is_some();
+        let env_vars = match &ssh_clone_request {
+            Some(request) => HashMap::from([(
+                OsString::from(ATTACH_CONTROL_PATH_ENV),
+                OsString::from(&request.socket_path),
+            )]),
+            None => HashMap::new(),
+        };
+
         let (pane_data, view) = self.create_terminal_pane_data(
             startup_directory,
-            HashMap::new(),
+            env_vars,
             IsSharedSessionCreator::No,
             chosen_shell,
             conversation_restoration,
@@ -6759,8 +6855,25 @@ impl PaneGroup {
 
         let _ = self.add_pane(direction, base_pane_id, Box::new(pane_data), true, ctx);
 
-        // Enter agent view if default session mode is Agent and AI is enabled
-        if should_immediately_enter_agent_view {
+        // A one-element queue: the interactive `ssh` block does not complete until logout, so a
+        // queued follow-up would run on the laptop after the user disconnected.
+        if let Some(request) = ssh_clone_request {
+            view.update(ctx, |terminal_view, ctx| {
+                terminal_view.set_pending_command_queue(vec![request.command], ctx);
+                // Entering agent view now would put a conversation over a pane that is still
+                // submitting `ssh`, so the user would be talking to an agent on their laptop while
+                // the pane authenticates to a remote host. Defer it the way the tab-config path
+                // defers setup commands. Note the deferral only fires once the `ssh` block
+                // completes, which for an interactive session means at logout.
+                if should_immediately_enter_agent_view {
+                    terminal_view.set_enter_agent_view_after_pending_commands();
+                }
+            });
+        }
+
+        // Enter agent view if default session mode is Agent and AI is enabled. A cloned split
+        // defers this instead, above.
+        if should_immediately_enter_agent_view && !is_ssh_clone {
             view.update(ctx, |terminal_view, ctx| {
                 terminal_view.enter_agent_view_for_new_conversation(
                     None,
@@ -8111,6 +8224,7 @@ impl PaneGroup {
             None, /* chosen_shell */
             None, /* conversation_restoration */
             DefaultSessionModeBehavior::Ignore,
+            None, /* ssh_clone_request */
             ctx,
         );
 
@@ -8232,7 +8346,7 @@ impl TypedActionView for PaneGroup {
                         _ => None,
                     }
                 };
-                self.add_terminal_pane(*direction, chosen_shell, ctx);
+                self.split_terminal_pane(*direction, self.focused_pane_id(ctx), chosen_shell, ctx);
             }
             Remove(view_id) => self.close_pane_with_confirmation(*view_id, ctx),
             RemoveActive => self.close_active_pane_with_confirmation(ctx),

@@ -192,6 +192,7 @@ pub(super) fn subscribe_to_link_model(
                 Some(path.clone()),
                 None,
                 DefaultSessionModeBehavior::Apply,
+                None, /* ssh_clone_request */
                 ctx,
             );
         }

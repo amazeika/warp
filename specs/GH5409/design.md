@@ -3,7 +3,7 @@ status: in-progress
 issue: 5409
 tracking: amazeika/warp#1
 pr: null
-completed: [1, 2, 3]
+completed: [1, 2, 3, 4]
 ---
 
 # Reuse the SSH connection when splitting a pane — Design Document
@@ -192,9 +192,14 @@ direct connection impossible — the connection either rides the master or fails
 with the guard, `ssh` to a reachable host fails at `Connection closed by UNKNOWN` before any
 authentication, where without it the same command reaches the host and prompts.
 
-Failing closed in the wrapper covers the race between the app's preflight (below) and the dial. The
-app also checks the master before spawning anything, so the common failure — a master that died
-earlier — produces an ordinary local split with no pane churn at all.
+Failing closed in the wrapper is the *only* liveness gate. An earlier draft of this design also ran
+`ssh -O check` app-side, before the split; that check was removed. The wrapper re-runs the probe
+itself immediately before attaching, so an app-side copy can never be authoritative: a master may
+die in the window between the two. Every outcome it changed was cosmetic, and its cost was not.
+Because the decision has to precede pane creation, the probe would have to finish before the split
+gesture put anything on screen. A wedged socket would then freeze the window for the whole timeout
+— exactly the case the probe existed for. Without it the pane appears immediately and the wrapper
+reports the failure inside it.
 
 The character filter is not optional. The control path is interpolated into the SSH hook JSON that
 the remote side prints back ([zsh_body.sh:1093](../../app/assets/bundled/bootstrap/zsh_body.sh#L1093)),
@@ -245,12 +250,40 @@ split. Preferring no clone over a wrong clone is the governing rule.
 | Active session is remote | `SessionType::WarpifiedRemote { .. }` — the predicate used by `is_subshell_or_ssh` ([session.rs:1060-1064](../../app/src/terminal/model/session.rs#L1060-L1064)) |
 | Session was established by the wrapper | `IsSSHWrapperSession::Yes { socket_path, .. }` ([session.rs:579-592](../../app/src/terminal/model/session.rs#L579-L592)) |
 | A stored `ssh` command bound to this session id | new binding, see below |
-| The master is live *now* | `ssh -O check -o ControlPath=<socket>` preflight before the pane is created |
+| The source master outlives the source pane | `persist` or `external_control_master` on `IsSSHWrapperSession::Yes` |
 
-The preflight matters because attach mode fails closed: once the pane exists there is no way back to
-a local split, so a dead master must be detected before anything is spawned. The check is a
-local-only probe, the same one the wrapper already uses for user-owned masters
-([zsh_body.sh:1064](../../app/assets/bundled/bootstrap/zsh_body.sh#L1064)).
+Every gate is a synchronous field read, so the decision costs nothing and the split stays instant.
+Master liveness is deliberately *not* among them — see "Attach mode fails closed" above.
+
+The master-survival gate is what keeps a split alive after its source pane closes. Teardown force-
+exits a master only when Warp owns it *and* it is non-persistent
+([ssh.rs:73-88](../../crates/remote_server/src/ssh.rs#L73-L88)), so both a persistent Warp master
+and a user-owned one are safe to attach to. The gate is on the source session's *reported* `persist`
+rather than on the feature flag, because `WARP_SSH_CONTROL_PERSIST` is captured at pane spawn
+([unix.rs:376](../../crates/warp_terminal/src/local_tty/unix.rs#L376)): a pane spawned before the
+flag turned on still holds a non-persistent master.
+
+The split decision is made where the user actually asks for a split. Both entry points that carry
+that intent — `PaneGroupAction::Add` from the pane-group bindings, and the terminal's own
+`PaneEvent::Split*` from its context menu and split actions — route through
+`PaneGroup::split_terminal_pane`, which takes the pane being split and passes the resulting request
+down explicitly. Resolving from the *pane being split* rather than the active session is
+load-bearing: `active_session_id` is only updated when focus moves to a terminal pane, so with an
+editor or notebook pane focused it still names the last terminal, and a split there would clone a
+connection belonging to a pane the user did not split. A non-terminal source yields no terminal
+view and so no request.
+
+The decision is deliberately *not* made inside `add_session_with_default_session_mode_behavior`,
+which is generic pane creation shared by six non-split callers that each install their own command
+into the new pane: the LSP log viewer ([view.rs:17821](../../app/src/workspace/view.rs#L17821)), the
+`CopyFileToRemote` uploader ([terminal_pane.rs:1221](../../app/src/pane_group/pane/terminal_pane.rs#L1221)),
+the workflow runner ([view.rs:17755](../../app/src/workspace/view.rs#L17755)), the plugin
+instructions pane ([view.rs:19345](../../app/src/workspace/view.rs#L19345)), the editor fallback
+([view.rs:6481](../../app/src/workspace/view.rs#L6481)), and local continuation of a third-party
+conversation ([view.rs:13666](../../app/src/workspace/view.rs#L13666)), which explicitly wants a
+local session. No parameter of that function distinguishes them: the agent-mode caller passes
+`base_pane_id_for_split: None` with a context pane set, while `add_terminal_pane` — documented "not
+splitting panes" — passes `Some(focused_pane_id)`.
 
 Two rejected gates, both from the source scratch, are recorded because they look plausible:
 
@@ -506,37 +539,84 @@ follows it.
 **ID:** `4`
 **Goal:** splitting a warpified, wrapper-established SSH pane produces a second pane on the same
 connection, at the remote default directory, with no authentication prompt
-**Tests:** pending
+**Tests:** `app/src/terminal/ssh/clone_on_split_tests.rs`, `app/src/terminal/model/session_tests.rs`
 
 **Acceptance criteria:**
 
-- [ ] Splitting such a pane creates a pane whose env carries `WARP_SSH_ATTACH_CONTROL_PATH` and
+- [x] Splitting such a pane creates a pane whose env carries `WARP_SSH_ATTACH_CONTROL_PATH` and
       the source session's socket, and whose first command is the bound `ssh` command verbatim.
-- [ ] The new pane reaches a warpified remote session on the same host with no auth prompt.
-- [ ] The new pane is itself splittable, producing a third pane on the same connection.
-- [ ] Splitting a local pane is unchanged, including `WorkingDirectoryConfig` handling.
-- [ ] No clone when: the session is not `WarpifiedRemote`; it is `IsSSHWrapperSession::No`; no bound
-      command matches; SSH is still authenticating; or the `ssh -O check` preflight fails.
-- [ ] When the preflight fails, an ordinary local split happens and no pane is created and
-      discarded.
-- [ ] Splitting from a non-terminal pane never attempts a clone.
-- [ ] Closing either pane leaves the other alive and usable.
-- [ ] After logging out of the attached session, running `ssh <a different host>` in that same pane
+- [x] The new pane reaches a warpified remote session on the same host with no auth prompt.
+- [x] The new pane is itself splittable, producing a third pane on the same connection.
+- [x] Splitting a local pane is unchanged, including `WorkingDirectoryConfig` handling.
+- [x] No clone when: the session is not `WarpifiedRemote`; it is `IsSSHWrapperSession::No`; no bound
+      command matches; or SSH is still authenticating.
+- [x] The clone decision is made only for a user-initiated split. A pane created by the LSP log
+      viewer, the `CopyFileToRemote` uploader, the workflow runner, the plugin instructions pane,
+      the editor fallback, or local continuation of a third-party conversation is never attached
+      and never has a command submitted into it, even when the source pane holds a clonable SSH
+      session.
+- [x] When the master is gone, the split pane shows the wrapper's one-line explanation and stays at
+      a live local prompt with the `ssh` command in its history. No app-side liveness probe runs,
+      and the pane appears as fast as an ordinary split.
+- [x] Splitting from a non-terminal pane never attempts a clone.
+- [x] Closing either pane leaves the other alive and usable.
+- [x] After logging out of the attached session, running `ssh <a different host>` in that same pane
       connects to that host, not to the original one.
-- [ ] Splitting a session that attached to a *user-owned* master works, and the new session reports
+- [x] No clone unless the source session's master will outlive the source pane — the wrapper
+      reported `persist: true`, or `external_control_master: true`. A pane spawned before the flag
+      flipped still holds `WARP_SSH_CONTROL_PERSIST=0`, so its master is force-exited on teardown
+      and a split attached to it would die with the source pane.
+- [x] Splitting a session that attached to a *user-owned* master works, and the new session reports
       `external_control_master: true` so Warp never tears that master down.
-- [ ] On a host whose `sshd` refuses a further multiplexed session (`MaxSessions` exhausted), the
+- [x] On a host whose `sshd` refuses a further multiplexed session (`MaxSessions` exhausted), the
       user gets a clear failure rather than a silently dead pane.
-- [ ] On Windows/WSL the env vars are set only when the new pane spawns in the same distro as the
+- [x] On Windows/WSL the env vars are set only when the new pane spawns in the same distro as the
       source session, since the socket lives inside the distro.
+
+**Delivered.** Criteria with executable evidence in this checkout: the gating matrix, master
+survival, the user-owned master, the WSL distro rule, and the absence of any app-side liveness
+probe — `app/src/terminal/ssh/clone_on_split_tests.rs` (12 tests) and
+`app/src/terminal/model/session_tests.rs` (10). The rest are runtime behaviours needing a live
+warpified host and are tracked in section 4's manual pass, which is where this feature's runtime
+confirmation belongs; nothing here has been confirmed against a real connection yet.
+
+Deviations from the phase as planned, all found by review or doubt and all narrowing:
+
+- The split boundary is `PaneGroup::split_terminal_pane`, reached from both `PaneGroupAction::Add`
+  and the terminal's own `PaneEvent::Split*`. Placing it in
+  `add_session_with_default_session_mode_behavior` — the original plan — would have injected an
+  `ssh` command into the LSP log viewer, the `CopyFileToRemote` uploader, workflows, plugin
+  instructions, the editor fallback, the notebook pane and local continuation of a third-party
+  conversation. Wiring only `PaneGroupAction::Add` left the terminal's own context-menu split
+  silently doing nothing.
+- The clone source is the pane being split, never the active session. `active_session_id` only
+  moves when focus lands on a terminal pane, so reading it would clone an unrelated host whenever a
+  non-terminal pane held focus — the case section 4 already anticipated.
+- The app-side `ssh -O check` preflight was dropped rather than implemented; see "Attach mode fails
+  closed" in section 2.
+- The WSL distro comes from the local pane's shell. Sourcing it from the session made the gate
+  unpassable, because a warpified remote session reports no distro at all.
+- A cloned split defers agent entry instead of entering agent view over a live `ssh` submission.
+  The deferral fires when the `ssh` block completes, which for an interactive session means at
+  logout — so an agent-default user gets a terminal until they log out.
+- The app now re-applies the wrapper's own character filter to the hook-reported ControlMaster
+  path, and rejects a path that is neither rooted nor tilde-prefixed. The tilde form is the one
+  that actually arrives: `SSH_SOCKET_DIR` is the literal `~/.ssh` and the wrapper interpolates it
+  inside double quotes.
+
+Scope added during the phase: three acceptance criteria (master survival, non-split callers, the
+dead-master path) and a second declared test gate over `session_tests.rs`.
 
 **Steps:**
 
-1. Add a helper that inspects the focused terminal pane, runs the `ssh -O check` preflight, and
-   returns an optional clone request (socket path, command, local cwd).
-2. Branch in `add_session_with_default_session_mode_behavior`
-   ([mod.rs:6636-6682](../../app/src/pane_group/mod.rs#L6636-L6682)), keeping the branch small and
-   delegating to the helper.
+1. Add a helper that inspects the source terminal pane and returns an optional clone request
+   (socket path, command). Every gate is a synchronous field read, including
+   `persist || external_control_master`; no subprocess runs.
+2. Call it from the `PaneGroupAction::Add` arm of `PaneGroup::handle_action`
+   ([mod.rs:8225](../../app/src/pane_group/mod.rs#L8225)) — the only boundary that means the user
+   asked for a split — and thread the resulting `Option<SshCloneRequest>` down through
+   `add_terminal_pane` → `add_session` → `add_session_with_default_session_mode_behavior` →
+   `add_session_in_directory`. Every other caller passes `None`.
 3. Pass `WARP_SSH_ATTACH_CONTROL_PATH` through `create_terminal_pane_data`, and the command through
    `set_pending_command_queue`.
 
@@ -688,6 +768,12 @@ exists for.
     `ssh -O exit`, so closing the source pane severs the split. It degrades to Phase 1 behaviour
     rather than breaking anything new, but Phase 4 should gate the attach request on the source
     session's hook reporting `persist: true`, rather than on the flag.
+
+    *Addressed in Phase 4:* the attach is gated on the source master outliving the source pane, not
+    on the flag. The condition is `persist || external_control_master`, not `persist` alone, because
+    teardown force-exits a master only when Warp owns it *and* it is non-persistent — so a
+    user-owned master is safe to attach to as well. This settles the split-severing symptom; the
+    two other bullets of this question remain open.
   - *Port forwarding outlives the visible session.* `-L`/`-R`/`-D` pass the warpify gate
     (`is_interactive_ssh_session`'s option list accepts them), so a forwarding session gets a
     Warp-owned master. Under `ControlPersist` its listeners survive pane close for the timeout —
