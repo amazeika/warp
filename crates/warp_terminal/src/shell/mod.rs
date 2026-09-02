@@ -1019,8 +1019,12 @@ mod tests;
 pub fn shell_escape_single_quotes(command: &str, shell_type: ShellType) -> String {
     match shell_type {
         ShellType::Fish => {
-            // Backslash-escape single quotes for Fish.
-            command.replace('\'', r"\'")
+            // Fish, unlike POSIX shells, honours backslash escapes inside single quotes, so the
+            // backslash has to be escaped before the quote is. Escaping only the quote lets an
+            // input ending in a backslash close the string early -- `a\` becomes `'a\\''`, whose
+            // second quote opens fresh syntax -- and everything after it is parsed as shell code
+            // rather than data.
+            command.replace('\\', r"\\").replace('\'', r"\'")
         }
         ShellType::PowerShell => {
             // In powershell we escape single quotes using two single quotes ''

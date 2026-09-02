@@ -10215,3 +10215,342 @@ fn back_button_label_resolves_token_only_parent_linkage() {
         });
     });
 }
+
+/// A split pane cloned onto its source pane's SSH connection carries that pane's remote directory
+/// and enters it once its own remote session bootstraps.
+///
+/// The lifetime under test is "the one attach attempt this split was made for". The directory was
+/// named by the source host, so anything that ends the attempt without warpifying has to drop it:
+/// the pane is then back at a local prompt, and the next `ssh` there may reach a different host.
+mod ssh_clone_split_remote_directory {
+    use warp_terminal::event::ExitReason;
+    use warp_terminal::model::session::get_local_hostname;
+
+    use super::*;
+    use crate::terminal::history::History;
+    use crate::terminal::model::session::command_executor::testing::TestCommandExecutor;
+    use crate::terminal::model::session::{Session, SessionInfo};
+
+    const REMOTE_CWD: &str = "/srv/app";
+    const CD: &str = "cd '/srv/app'";
+    const SSH_COMMAND: &str = "ssh -J bastion mini";
+
+    /// Drives a session bootstrap in `terminal`. A hostname unlike the local one is what makes
+    /// the resulting session `WarpifiedRemote`, exactly as a real `ssh` does.
+    fn bootstrap_session(terminal: &ViewHandle<TerminalView>, app: &mut App, hostname: &str) {
+        terminal.update(app, |view, _ctx| {
+            let mut model = view.model.lock();
+            model.init_shell(InitShellValue {
+                session_id: 0.into(),
+                shell: "bash".to_owned(),
+                hostname: hostname.to_owned(),
+                ..Default::default()
+            });
+            model.bootstrapped(BootstrappedValue {
+                shell: "bash".to_owned(),
+                ..Default::default()
+            });
+        });
+    }
+
+    fn bootstrap_remote(terminal: &ViewHandle<TerminalView>, app: &mut App) {
+        bootstrap_session(terminal, app, "build-host");
+    }
+
+    fn bootstrap_local(terminal: &ViewHandle<TerminalView>, app: &mut App) {
+        let hostname = get_local_hostname().expect("the test host has a hostname");
+        bootstrap_session(terminal, app, &hostname);
+    }
+
+    fn arm(terminal: &ViewHandle<TerminalView>, app: &mut App, remote_cwd: &str) {
+        terminal.update(app, |view, _ctx| {
+            view.set_pending_remote_cwd(Some(remote_cwd.to_owned()));
+        });
+    }
+
+    /// Puts the pane in the state `can_execute_command` requires: an active block bound to a
+    /// session whose history is appendable. The mock terminal leaves the active block with no
+    /// session id, so without this the `cd` would sit in the input unexecuted and these tests
+    /// could not tell a submitted command from inserted text — the gap a review finding named.
+    fn allow_command_execution(terminal: &ViewHandle<TerminalView>, app: &mut App) {
+        let session = Arc::new(Session::new(
+            SessionInfo::new_for_test(),
+            Arc::new(TestCommandExecutor::default()),
+        ));
+        let session_id = session.id();
+        History::handle(app).update(app, |history, ctx| {
+            history.init_session_with(session, async move { Vec::new() }, ctx);
+        });
+        terminal.update(app, |view, _ctx| {
+            view.model
+                .lock()
+                .block_list_mut()
+                .active_block_mut()
+                .set_session_id(session_id);
+        });
+    }
+
+    /// The replayed `ssh` completing as an ordinary user block — the shape every non-warpifying
+    /// outcome takes, whether the wrapper refused, the host refused, or the user interrupted.
+    fn end_attach_attempt(terminal: &ViewHandle<TerminalView>, app: &mut App) {
+        terminal.update(app, |view, ctx| {
+            let block_id = view.model.lock().block_list().active_block_id().clone();
+            view.on_user_block_completed(&block_id, ctx);
+        });
+    }
+
+    fn input_text(terminal: &ViewHandle<TerminalView>, app: &App) -> String {
+        terminal.read(app, |view, _ctx| {
+            view.input.read(app, |input, ctx| input.buffer_text(ctx))
+        })
+    }
+
+    fn pending_remote_cwd(terminal: &ViewHandle<TerminalView>, app: &App) -> Option<String> {
+        terminal.read(app, |view, _ctx| view.pending_remote_cwd.clone())
+    }
+
+    /// The pending directory reaching the input is only half the criterion — `set_pending_command`
+    /// inserts into the buffer before execution is even attempted, so an assertion on the buffer
+    /// alone passes while the command sits there unexecuted. Pair this with `input_text` to pin
+    /// both that a command was submitted and exactly which one: the mock terminal has no pty to
+    /// echo a new block, so the submitted text stays in the buffer for the assertion to read.
+    fn was_submitted(terminal: &ViewHandle<TerminalView>, app: &App) -> bool {
+        terminal.read(app, |view, _ctx| {
+            view.awaiting_pending_command_completion
+                && !view.input.read(app, |input, _| input.has_pending_command())
+        })
+    }
+
+    #[test]
+    fn enters_the_remote_directory_when_the_remote_session_bootstraps() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+            allow_command_execution(&terminal, &mut app);
+            arm(&terminal, &mut app, REMOTE_CWD);
+
+            bootstrap_remote(&terminal, &mut app);
+
+            assert_eventually!(
+                was_submitted(&terminal, &app),
+                "The split pane never submitted the source pane's remote directory"
+            );
+            assert_eq!(
+                input_text(&terminal, &app),
+                CD,
+                "the submitted command must be exactly the quoted directory"
+            );
+        })
+    }
+
+    /// A cloned split's local shell bootstraps before its `ssh` does. Entering there would `cd`
+    /// the laptop into a path that exists only on the remote host, and would consume the
+    /// directory the remote session still needs.
+    #[test]
+    fn does_not_enter_the_remote_directory_in_a_local_session() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+            arm(&terminal, &mut app, REMOTE_CWD);
+
+            bootstrap_local(&terminal, &mut app);
+
+            assert_eventually!(
+                terminal.read(&app, |view, _ctx| view.is_login_shell_bootstrapped),
+                "The local session never bootstrapped"
+            );
+            assert!(
+                !input_text(&terminal, &app).contains("cd "),
+                "A local session must not be sent the remote directory"
+            );
+            assert_eq!(
+                pending_remote_cwd(&terminal, &app),
+                Some(REMOTE_CWD.to_owned()),
+                "The remote session that follows still needs the directory"
+            );
+        })
+    }
+
+    /// Regression for a review finding: the 7s bootstrap timer only warns — it reports a *slow*
+    /// bootstrap and opens an auto-dismissing banner, and never aborts warpification. A session
+    /// that takes longer than that and then succeeds must still land in the right directory.
+    #[test]
+    fn enters_the_remote_directory_when_bootstrap_arrives_after_the_slow_bootstrap_timer() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+            allow_command_execution(&terminal, &mut app);
+            arm(&terminal, &mut app, REMOTE_CWD);
+
+            terminal.update(&mut app, |view, ctx| {
+                view.on_bootstrap_failed_timer_complete((), ctx);
+            });
+            assert_eq!(
+                pending_remote_cwd(&terminal, &app),
+                Some(REMOTE_CWD.to_owned()),
+                "A slow bootstrap is not an abandoned one"
+            );
+
+            bootstrap_remote(&terminal, &mut app);
+
+            assert_eventually!(
+                was_submitted(&terminal, &app),
+                "A late but successful bootstrap must still enter the remote directory"
+            );
+        })
+    }
+
+    /// Regression for a review finding: the wrapper fails closed on a dead master, so the
+    /// replayed `ssh` can complete without ever warpifying and leave the pane at its local
+    /// prompt. A directory named by the source host must not still be waiting there — the user's
+    /// next `ssh` may reach an entirely different machine.
+    #[test]
+    fn drops_the_remote_directory_when_the_replayed_ssh_ends_without_warpifying() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+            arm(&terminal, &mut app, REMOTE_CWD);
+
+            end_attach_attempt(&terminal, &mut app);
+
+            assert_eq!(
+                pending_remote_cwd(&terminal, &app),
+                None,
+                "The attach attempt ended, so its directory must not outlive it"
+            );
+        })
+    }
+
+    /// The consequence of the case above, stated as the behaviour that actually matters.
+    #[test]
+    fn does_not_enter_a_stale_directory_in_a_later_unrelated_remote_session() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+            arm(&terminal, &mut app, REMOTE_CWD);
+
+            // The clone's `ssh` fails closed and returns the pane to its local prompt.
+            end_attach_attempt(&terminal, &mut app);
+            // The user then reaches a different host from that same pane.
+            bootstrap_remote(&terminal, &mut app);
+
+            assert_eventually!(
+                terminal.read(&app, |view, _ctx| view.is_login_shell_bootstrapped),
+                "The later session never bootstrapped"
+            );
+            assert!(
+                !input_text(&terminal, &app).contains(CD),
+                "An unrelated host must not be sent the first host's directory"
+            );
+            assert!(!was_submitted(&terminal, &app));
+        })
+    }
+
+    /// A cloned split whose local shell exits takes the directory with it.
+    #[test]
+    fn drops_the_remote_directory_when_the_shell_exits() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+            arm(&terminal, &mut app, REMOTE_CWD);
+
+            bootstrap_local(&terminal, &mut app);
+            assert_eventually!(
+                terminal.read(&app, |view, _ctx| view.is_login_shell_bootstrapped),
+                "The local session never bootstrapped"
+            );
+            terminal.update(&mut app, |view, ctx| {
+                view.handle_terminal_event(
+                    &ModelEvent::Exit {
+                        reason: ExitReason::ShellProcessExited,
+                    },
+                    ctx,
+                );
+            });
+
+            assert_eq!(pending_remote_cwd(&terminal, &app), None);
+        })
+    }
+
+    /// The command queue advances only when the previous command's block completes, and an
+    /// interactive `ssh` block does not complete until logout — a queued `cd` would run on the
+    /// laptop after the user disconnected.
+    #[test]
+    fn does_not_queue_the_remote_directory_behind_the_ssh_command() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+            allow_command_execution(&terminal, &mut app);
+            terminal.update(&mut app, |view, ctx| {
+                view.set_pending_command_queue(vec![SSH_COMMAND.to_owned()], ctx);
+                view.set_pending_remote_cwd(Some(REMOTE_CWD.to_owned()));
+            });
+
+            bootstrap_remote(&terminal, &mut app);
+
+            assert_eventually!(
+                was_submitted(&terminal, &app),
+                "The split pane never submitted the source pane's remote directory"
+            );
+            assert!(
+                terminal.read(&app, |view, _ctx| view.pending_command_queue.is_empty()),
+                "The remote directory must not be added to the command queue"
+            );
+        })
+    }
+
+    /// Regression for a review finding: the directory is quoted for the shell the *remote*
+    /// session reported, not for the pane's local one. Fish honours backslash escapes inside
+    /// single quotes, so POSIX quoting there would end the `cd` early and run the rest.
+    #[test]
+    fn quotes_the_remote_directory_for_the_shell_that_will_parse_it() {
+        let hostile = r"a\'; echo INJECTED #";
+
+        let bash = format!("cd {}", shell_quote_arg(hostile, ShellType::Bash));
+        let fish = format!("cd {}", shell_quote_arg(hostile, ShellType::Fish));
+
+        assert_eq!(bash, r#"cd 'a\'"'"'; echo INJECTED #'"#);
+        assert_eq!(fish, r"cd 'a\\\'; echo INJECTED #'");
+        assert_ne!(
+            bash, fish,
+            "one quoting cannot serve both, which is why the receiving shell decides"
+        );
+    }
+
+    /// Whatever the user had typed is replaced rather than run as part of the same line:
+    /// `set_pending_command` inserts at the cursor, so a merged line would submit both.
+    #[test]
+    fn does_not_merge_the_remote_directory_with_text_already_in_the_input() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+            allow_command_execution(&terminal, &mut app);
+            arm(&terminal, &mut app, REMOTE_CWD);
+            terminal.update(&mut app, |view, ctx| {
+                view.input.update(ctx, |input, ctx| {
+                    input.replace_buffer_content("rm -rf /", ctx);
+                });
+            });
+
+            bootstrap_remote(&terminal, &mut app);
+
+            assert_eventually!(
+                was_submitted(&terminal, &app),
+                "The split pane never submitted the source pane's remote directory"
+            );
+            assert_eq!(
+                input_text(&terminal, &app),
+                CD,
+                "pre-existing input must not ride along with the cd"
+            );
+        })
+    }
+}

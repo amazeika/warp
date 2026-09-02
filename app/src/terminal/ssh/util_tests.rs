@@ -135,3 +135,48 @@ fn ssh_interactive_shell_parsing() {
             == Some("localhost".to_string())
     );
 }
+
+#[test]
+fn submittable_remote_cwd_accepts_paths_with_shell_metacharacters() {
+    for (name, cwd) in [
+        ("space", "/srv/my app"),
+        ("single quote", "/srv/o'brien"),
+        ("backslash", r"/srv/back\slash"),
+        ("dollar", "/srv/$HOME"),
+        ("backtick", "/srv/`whoami`"),
+        ("command substitution", "/srv/$(id -u)"),
+        ("semicolon", "/srv/a;rm -rf b"),
+        ("non-ASCII", "/srv/\u{5de5}\u{4f5c}/na\u{ef}ve"),
+    ] {
+        assert_eq!(
+            submittable_remote_cwd(cwd),
+            Some(cwd),
+            "{name} is quotable by the caller and must not be refused here"
+        );
+    }
+}
+
+/// No quoting survives a line ending: it would end the submitted line and make the remainder a
+/// second command. Such a path is refused, not sanitized.
+#[test]
+fn submittable_remote_cwd_refuses_a_path_containing_a_control_character() {
+    for (name, cwd) in [
+        ("newline", "/srv/app\nrm -rf /"),
+        ("carriage return", "/srv/app\rrm -rf /"),
+        ("tab", "/srv/app\tx"),
+        ("escape", "/srv/app\x1b[2J"),
+        ("NUL", "/srv/app\0"),
+        ("bare newline", "\n"),
+    ] {
+        assert_eq!(
+            submittable_remote_cwd(cwd),
+            None,
+            "a path containing a {name} must not be submitted"
+        );
+    }
+}
+
+#[test]
+fn submittable_remote_cwd_refuses_an_empty_path() {
+    assert_eq!(submittable_remote_cwd(""), None);
+}
