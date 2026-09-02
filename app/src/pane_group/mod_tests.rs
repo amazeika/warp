@@ -3976,3 +3976,95 @@ fn test_undo_close_keeps_a_file_pane_watching_its_file() {
         });
     });
 }
+
+/// `CloneGate` proves the rule; this proves the wiring. Each condition has to come from its own
+/// real source, and nothing in `clone_on_split_tests.rs` can catch a literal accidentally left in
+/// place of one of these reads — that would satisfy the rule while ignoring the user entirely.
+#[test]
+fn ssh_clone_gate_reads_each_condition_from_its_own_source() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let _flag = FeatureFlag::CloneSshOnSplit.override_enabled(true);
+        WarpifySettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings
+                .enable_ssh_warpification
+                .set_value(true, ctx)
+                .unwrap();
+        });
+        SshSettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.clone_ssh_on_split.set_value(true, ctx).unwrap();
+        });
+
+        app.read(|ctx| {
+            assert_eq!(
+                PaneGroup::ssh_clone_gate(ctx),
+                CloneGate {
+                    feature_flag: true,
+                    ssh_warpification: true,
+                    setting: true,
+                }
+            );
+        });
+
+        // Each source, turned off on its own, has to reach its own field.
+        SshSettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.clone_ssh_on_split.set_value(false, ctx).unwrap();
+        });
+        app.read(|ctx| {
+            let gate = PaneGroup::ssh_clone_gate(ctx);
+            assert!(
+                !gate.setting,
+                "the opt-in must come from the user's setting"
+            );
+            assert!(gate.ssh_warpification && gate.feature_flag);
+            assert!(!gate.is_open());
+        });
+
+        SshSettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.clone_ssh_on_split.set_value(true, ctx).unwrap();
+        });
+        WarpifySettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings
+                .enable_ssh_warpification
+                .set_value(false, ctx)
+                .unwrap();
+        });
+        app.read(|ctx| {
+            let gate = PaneGroup::ssh_clone_gate(ctx);
+            assert!(
+                !gate.ssh_warpification,
+                "warpification must come from the warpify setting, not the clone setting"
+            );
+            assert!(gate.setting && gate.feature_flag);
+            assert!(!gate.is_open());
+        });
+    });
+}
+
+/// The flag is the rollout control, so it has to close the gate even with both settings on.
+#[test]
+fn ssh_clone_gate_is_closed_while_the_feature_flag_is_off() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        WarpifySettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings
+                .enable_ssh_warpification
+                .set_value(true, ctx)
+                .unwrap();
+        });
+        SshSettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.clone_ssh_on_split.set_value(true, ctx).unwrap();
+        });
+
+        app.read(|ctx| {
+            let gate = PaneGroup::ssh_clone_gate(ctx);
+            assert!(!gate.feature_flag);
+            assert!(
+                !gate.is_open(),
+                "the flag must win over a user who opted in"
+            );
+        });
+    });
+}

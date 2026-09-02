@@ -3,7 +3,7 @@ status: in-progress
 issue: 5409
 tracking: amazeika/warp#1
 pr: null
-completed: [1, 2, 3, 4, 5]
+completed: [1, 2, 3, 4, 5, 6]
 ---
 
 # Reuse the SSH connection when splitting a pane — Design Document
@@ -389,10 +389,17 @@ the SSH hook JSON.
 
 A new `clone_ssh_on_split` bool joins `SshSettings`
 ([settings/ssh.rs](../../app/src/settings/ssh.rs)) under `warpify.ssh.clone_ssh_on_split`, surfaced
-as a checkbox in `SSHWidget` ([warpify_page.rs:611](../../app/src/settings_view/warpify_page.rs#L611)),
-mirroring the `reuse_existing_control_master` row at
-[:692-713](../../app/src/settings_view/warpify_page.rs#L692-L713). The product default is on; it
-ships behind a feature flag defaulting off until it has soaked.
+as a checkbox in its own `SshCloneOnSplitWidget` in
+[warpify_page.rs](../../app/src/settings_view/warpify_page.rs), built into the SSH category only
+when the feature flag is on and modelled on the `reuse_existing_control_master` row beside it. It
+gets its own widget rather than a row inside `SSHWidget` because a widget is the smallest unit
+settings search can filter, so a row hidden under advertised search terms would make the page match
+a query and then show nothing for it.
+
+The setting defaults **off**, and the feature flag defaults off as well: the behavior has to soak
+before either becomes the default. Splitting is gated on the flag, this setting, and
+`enable_ssh_warpification` together — without the wrapper the new pane's shell never runs
+`warp_ssh_helper`, so a replayed `ssh` would dial the host itself and prompt for credentials.
 
 ## 3. Implementation
 
@@ -738,18 +745,20 @@ on the input buffer passed while nothing had been submitted.
 
 **ID:** `6`
 **Goal:** users can turn the behavior off, and it ships disabled until it has soaked
-**Tests:** pending
+**Tests:** `app/src/settings/ssh_tests.rs`, `app/src/settings_view/warpify_page_tests.rs`, `app/src/terminal/ssh/clone_on_split_tests.rs`, `app/src/terminal/view_tests.rs`, `app/src/pane_group/mod_tests.rs`
 
 **Acceptance criteria:**
 
-- [ ] `warpify.ssh.clone_ssh_on_split` exists in `SshSettings` and round-trips through
+- [x] `warpify.ssh.clone_ssh_on_split` exists in `SshSettings` and round-trips through
       `~/.warp/settings.toml`.
-- [ ] The Warpify settings page shows the checkbox in the SSH section and it is discoverable via
+- [x] The Warpify settings page shows the checkbox in the SSH section and it is discoverable via
       settings search.
-- [ ] With the setting off, splitting an SSH pane produces a local pane.
-- [ ] With the feature flag off, the behavior is entirely absent regardless of the setting,
+- [x] With the setting off, splitting an SSH pane produces a local pane.
+- [x] With the feature flag off, the behavior is entirely absent regardless of the setting,
       including the Phase 2 lifetime change.
-- [ ] Telemetry records clone attempted, succeeded, and fell-back-to-local.
+- [x] Telemetry records clone attempted, succeeded, and fell-back-to-local.
+- [x] Telemetry reports success only from the new pane's bootstrap outcome, never from the
+      decision to attach. *(Added during the phase — see below.)*
 
 **Steps:**
 
@@ -758,6 +767,70 @@ on the input buffer passed while nothing had been submitted.
    `reuse_existing_control_master` pattern.
 2. Add telemetry per `add-telemetry` (the feature flag already exists from Phase 2).
 3. Add the changelog entry.
+
+**Delivered.** The setting is `warpify.ssh.clone_ssh_on_split`, defaulting off, in its own
+`SshCloneOnSplitWidget` built only when the flag is on. A split may attach only when the feature
+flag, `enable_ssh_warpification`, and this setting all hold, expressed as `CloneGate` in
+[clone_on_split.rs](../../app/src/terminal/ssh/clone_on_split.rs) and sourced by
+`PaneGroup::ssh_clone_gate`.
+
+Three changes came from review rather than the plan, and the first is a defect the phase would
+otherwise have shipped:
+
+- **Warpification is part of the gate.** Gating on the flag and the setting alone let a pane
+  spawned with the SSH wrapper off still receive a clone request. That pane carries
+  `WARP_USE_SSH_WRAPPER=0`, so its bootstrap never calls `warp_ssh_helper` and never reads
+  `WARP_SSH_ATTACH_CONTROL_PATH`; the replayed `ssh` would run as a plain command and prompt for
+  the credentials this feature exists to avoid — worse than the local pane it replaced. Reachable
+  because turning warpification off leaves this setting set: the page only disables its switch
+  rather than clearing the value.
+  `reuse_existing_control_master` already guards itself the same way at
+  [terminal_manager.rs:852](../../app/src/terminal/local_tty/terminal_manager.rs#L852).
+- **The gate is a named type, not an inline conjunction.** Three same-typed bools at a call site
+  are swappable, and dropping one would compile and break no test. `CloneGate` makes removing a
+  condition a compile error, and `ssh_clone_gate` is split out so a test can pin that each
+  condition comes from its own real source — the rule and its wiring are separately provable.
+- **A pane closed mid-connect reports `Abandoned`.** The Exit path originally cleared the pending
+  attach silently, which orphaned its `Requested` event: any success rate would then have been
+  depressed by ordinary pane closes, in telemetry whose whole purpose is judging the soak.
+  `Requested` now resolves into exactly one of `Succeeded`, `FellBackToLocal`, or `Abandoned`.
+
+Deviations from the phase as planned, all traced to the pre-implementation challenge on the
+`clone_request` contract:
+
+- **`Ok` is not success, so success is not this module's to report.** The phase as planned put all
+  three telemetry outcomes at the split site. `clone_on_split.rs` deliberately does not gate on
+  master liveness — the wrapper re-runs `ssh -O check` after the app has decided, and fails closed
+  on a master that has gone away. Reporting success from `clone_request`'s return would therefore
+  have claimed it in exactly the dead-master case this feature is judged on. `Requested` and
+  `Declined { reason }` now fire at the split; `Succeeded` and `FellBackToLocal` fire from the new
+  pane's own bootstrap outcome, which is the first moment anything in the app knows.
+- **`clone_request` returns `Result<SshCloneRequest, CloneDeclined>`.** A bare `Option` cannot name
+  which gate refused, and the decline reason is what makes the fallback rate readable. The 15
+  pre-existing tests now assert *which* gate fired rather than only that none passed.
+- **The fallback line is drawn at "the user split a warpified SSH pane".** `CloneDeclined::is_fallback`
+  excludes `Disabled` and `NotWarpifiedRemote` — ordinary local splits and deliberate opt-outs would
+  otherwise drown the rate. It deliberately *includes* `NoWrapperSocket` and
+  `MasterWouldNotOutliveSource`: the feature could never have served those panes, but the user
+  experienced the same fallback, and both stay separable by reason.
+- **A clone needs its own marker.** `pending_remote_cwd` is legitimately `None` for a clone whose
+  source pane reported no directory, so it cannot say "an attach is outstanding".
+  `TerminalView::awaiting_ssh_clone` carries that, with the same lifetime, and
+  `set_pending_remote_cwd` became `set_pending_ssh_clone`. This reaches into Phase 5's code.
+- **The setting deliberately does not reach `WARP_SSH_CONTROL_PERSIST`.** The fourth criterion's
+  ControlPersist clause was already satisfied at pane spawn by Phase 2's flag gate
+  ([unix.rs:379](../../crates/warp_terminal/src/local_tty/unix.rs#L379)). The setting is read at
+  split time, so it could never retroactively change the lifetime of a master a pane already holds.
+  Nothing in this phase was needed for that clause.
+
+Scope added during the phase: one acceptance criterion (honest success reporting), three declared
+test gates (`app/src/settings/ssh_tests.rs`, `app/src/settings_view/warpify_page_tests.rs`,
+`app/src/pane_group/mod_tests.rs`), a fourth telemetry event plus `Abandoned`, and Phase 5's
+`view.rs` entering this phase's change set.
+
+Not in this commit: the changelog entry is a `CHANGELOG-NEW-FEATURE:` marker in the PR description
+per [pull_request_template.md](../../.github/pull_request_template.md), not a file in the tree, so
+it lands when the PR is opened.
 
 ### Phase 7: Full test sweep
 
@@ -813,8 +886,9 @@ exists for.
 
 ## 5. Open Questions
 
-- **Default on or off at GA?** The product intent is on; Warp will likely want the flag off through
-  at least one release. Settle on the spec PR.
+- **Default on or off at GA?** *Resolved in Phase 6: both the flag and the setting ship off.* The
+  product intent remains on at GA; flipping the setting's default is a separate, deliberate step
+  once the flag has soaked.
 - **`ControlPersist` value.** *Resolved in Phase 2: `ControlPersist=60`.* Long enough that any
   split-then-close ordering keeps the connection, short enough to bound how long an authenticated
   session lingers past visible use.
@@ -824,6 +898,14 @@ exists for.
   matters.
 - **New tab and new window from an SSH pane.** Out of scope here; the Phase 4 helper is written so
   this is a small follow-up.
+- **Should opting out of the split also stop `ControlPersist`?** Raised by review in Phase 6. With
+  the flag on and `clone_ssh_on_split` off, every Warp-owned master still gets `ControlPersist=60`,
+  because `WARP_SSH_CONTROL_PERSIST` is read at pane spawn from the flag alone
+  ([unix.rs:379](../../crates/warp_terminal/src/local_tty/unix.rs#L379)). Users who explicitly
+  declined the only feature that consumes those lingering masters still pay for them. This meets
+  Phase 6's fourth criterion, which deliberately ties the lifetime change to the flag, and the
+  spawn-time read is the same shape `reuse_existing_control_master` already uses, so ANDing the
+  setting in is feasible. **Settle before the flag promotes to Stable**, not in this spec.
 - **Windows/WSL.** Whether the wrapper attach path is reachable and correct there is unexamined
   beyond the same-distro constraint recorded in Phase 4.
 - **Does `ControlPersist` need a last-client check after all?** Section 2 rejected an

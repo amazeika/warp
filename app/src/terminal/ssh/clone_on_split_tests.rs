@@ -57,7 +57,7 @@ fn attaches_to_a_user_owned_master() {
     };
 
     assert!(
-        clone_request(&source(remote(), wrapper), None, true).is_some(),
+        clone_request(&source(remote(), wrapper), None, true).is_ok(),
         "a master Warp does not own survives the source pane, so a split may attach to it"
     );
 }
@@ -72,14 +72,20 @@ fn does_not_attach_to_a_master_that_dies_with_the_source_pane() {
         persist: false,
     };
 
-    assert_eq!(clone_request(&source(remote(), wrapper), None, true), None);
+    assert_eq!(
+        clone_request(&source(remote(), wrapper), None, true),
+        Err(CloneDeclined::MasterWouldNotOutliveSource)
+    );
 }
 
 #[test]
 fn does_not_attach_to_a_local_session() {
     let source = source(SessionType::Local, warp_persistent_master());
 
-    assert_eq!(clone_request(&source, None, true), None);
+    assert_eq!(
+        clone_request(&source, None, true),
+        Err(CloneDeclined::NotWarpifiedRemote)
+    );
 }
 
 /// A session warpified by the RC-file snippet inside an unwrapped `ssh` carries no socket.
@@ -87,7 +93,10 @@ fn does_not_attach_to_a_local_session() {
 fn does_not_attach_to_a_session_the_wrapper_did_not_establish() {
     let source = source(remote(), IsSSHWrapperSession::No);
 
-    assert_eq!(clone_request(&source, None, true), None);
+    assert_eq!(
+        clone_request(&source, None, true),
+        Err(CloneDeclined::NoWrapperSocket)
+    );
 }
 
 #[test]
@@ -97,7 +106,10 @@ fn does_not_attach_without_a_bound_command() {
         ..source(remote(), warp_persistent_master())
     };
 
-    assert_eq!(clone_request(&source, None, true), None);
+    assert_eq!(
+        clone_request(&source, None, true),
+        Err(CloneDeclined::NoBoundCommand)
+    );
 }
 
 /// The ControlMaster socket lives inside the distro, so no pane outside it can reach the socket.
@@ -108,7 +120,10 @@ fn does_not_attach_across_wsl_distros() {
         ..source(remote(), warp_persistent_master())
     };
 
-    assert_eq!(clone_request(&source, Some("Debian"), true), None);
+    assert_eq!(
+        clone_request(&source, Some("Debian"), true),
+        Err(CloneDeclined::WslDistroMismatch)
+    );
 }
 
 #[test]
@@ -118,14 +133,17 @@ fn attaches_within_one_wsl_distro() {
         ..source(remote(), warp_persistent_master())
     };
 
-    assert!(clone_request(&source, Some("Ubuntu"), true).is_some());
+    assert!(clone_request(&source, Some("Ubuntu"), true).is_ok());
 }
 
 #[test]
 fn does_not_attach_when_the_feature_is_disabled() {
     let source = source(remote(), warp_persistent_master());
 
-    assert_eq!(clone_request(&source, None, false), None);
+    assert_eq!(
+        clone_request(&source, None, false),
+        Err(CloneDeclined::Disabled)
+    );
 }
 
 /// A remote session reports no WSL distro of its own — its `wsl_name` carries the remote host's
@@ -137,7 +155,10 @@ fn does_not_attach_when_the_source_reports_no_distro_but_the_target_is_wsl() {
     let source = source(remote(), warp_persistent_master());
     assert_eq!(source.wsl_distro, None);
 
-    assert_eq!(clone_request(&source, Some("Ubuntu"), true), None);
+    assert_eq!(
+        clone_request(&source, Some("Ubuntu"), true),
+        Err(CloneDeclined::WslDistroMismatch)
+    );
 }
 
 /// The mirror of the case above: a local pane outside WSL splitting into a non-WSL pane. Both
@@ -146,7 +167,7 @@ fn does_not_attach_when_the_source_reports_no_distro_but_the_target_is_wsl() {
 fn attaches_when_neither_pane_is_wsl() {
     let source = source(remote(), warp_persistent_master());
 
-    assert!(clone_request(&source, None, true).is_some());
+    assert!(clone_request(&source, None, true).is_ok());
 }
 
 /// The whole point of the phase: the new pane lands where the source pane was, not in the remote
@@ -186,4 +207,135 @@ fn attaches_without_a_directory_the_remote_host_cannot_name_safely() {
     let request = clone_request(&source, None, true).expect("a refused directory is not a gate");
 
     assert_eq!(request.remote_cwd, None);
+}
+
+/// The population the fallback rate is about: the user split a warpified SSH pane and got a local
+/// one. A pane the feature could never have served still counts — the user experienced the same
+/// thing — and stays separable by reason.
+#[test]
+fn counts_a_refused_ssh_split_as_a_fallback() {
+    for declined in [
+        CloneDeclined::NoWrapperSocket,
+        CloneDeclined::MasterWouldNotOutliveSource,
+        CloneDeclined::WslDistroMismatch,
+        CloneDeclined::NoBoundCommand,
+    ] {
+        assert!(declined.is_fallback(), "{declined:?}");
+    }
+}
+
+/// A split that was never a candidate is not a fallback: counting ordinary local splits, or splits
+/// the user opted out of, would drown the rate the feature is judged by.
+#[test]
+fn does_not_count_a_non_candidate_split_as_a_fallback() {
+    for declined in [CloneDeclined::Disabled, CloneDeclined::NotWarpifiedRemote] {
+        assert!(!declined.is_fallback(), "{declined:?}");
+    }
+}
+
+/// Dashboards key on these strings, so a variant rename must not rewrite their history.
+#[test]
+fn names_each_decline_reason_stably() {
+    assert_eq!(CloneDeclined::Disabled.telemetry_reason(), "disabled");
+    assert_eq!(
+        CloneDeclined::NotWarpifiedRemote.telemetry_reason(),
+        "not_warpified_remote"
+    );
+    assert_eq!(
+        CloneDeclined::NoWrapperSocket.telemetry_reason(),
+        "no_wrapper_socket"
+    );
+    assert_eq!(
+        CloneDeclined::MasterWouldNotOutliveSource.telemetry_reason(),
+        "master_would_not_outlive_source"
+    );
+    assert_eq!(
+        CloneDeclined::WslDistroMismatch.telemetry_reason(),
+        "wsl_distro_mismatch"
+    );
+    assert_eq!(
+        CloneDeclined::NoBoundCommand.telemetry_reason(),
+        "no_bound_command"
+    );
+}
+
+/// The gate is the only place the user's setting reaches behavior, so its truth table is pinned
+/// here rather than left to the call site. Every condition is necessary: dropping any one of them
+/// would clone for people who turned the feature off, or into a pane whose shell cannot attach.
+#[test]
+fn opens_the_gate_only_when_every_condition_holds() {
+    let open = CloneGate {
+        feature_flag: true,
+        ssh_warpification: true,
+        setting: true,
+    };
+
+    assert!(open.is_open());
+
+    for (label, gate) in [
+        (
+            "feature flag off",
+            CloneGate {
+                feature_flag: false,
+                ..open
+            },
+        ),
+        (
+            "ssh warpification off",
+            CloneGate {
+                ssh_warpification: false,
+                ..open
+            },
+        ),
+        (
+            "setting off",
+            CloneGate {
+                setting: false,
+                ..open
+            },
+        ),
+    ] {
+        assert!(!gate.is_open(), "{label} must close the gate");
+    }
+}
+
+/// The flag is the rollout control, so it has to win even when the user has opted in.
+#[test]
+fn the_feature_flag_closes_the_gate_over_an_enabled_setting() {
+    let gate = CloneGate {
+        feature_flag: false,
+        ssh_warpification: true,
+        setting: true,
+    };
+
+    assert!(!gate.is_open());
+    assert_eq!(
+        clone_request(
+            &source(remote(), warp_persistent_master()),
+            None,
+            gate.is_open()
+        ),
+        Err(CloneDeclined::Disabled)
+    );
+}
+
+/// Warpification off means the split's shell never runs `warp_ssh_helper`, so a replayed `ssh`
+/// would dial the host itself and prompt for the credentials this feature exists to avoid.
+#[test]
+fn ssh_warpification_off_closes_the_gate_over_an_enabled_setting() {
+    let gate = CloneGate {
+        feature_flag: true,
+        ssh_warpification: false,
+        setting: true,
+    };
+
+    assert!(!gate.is_open());
+    assert_eq!(
+        clone_request(
+            &source(remote(), warp_persistent_master()),
+            None,
+            gate.is_open()
+        ),
+        Err(CloneDeclined::Disabled)
+    );
 }

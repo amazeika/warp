@@ -116,7 +116,7 @@ use crate::server::telemetry::{
     AnonymousUserSignupEntrypoint, PaletteSource, SharingDialogSource, TelemetryEvent,
 };
 use crate::session_management::SessionNavigationData;
-use crate::settings::{AISettings, DefaultSessionMode, PaneSettings};
+use crate::settings::{AISettings, DefaultSessionMode, PaneSettings, SshSettings};
 use crate::settings_view::SettingsSection;
 use crate::settings_view::mcp_servers_page::MCPServersSettingsPage;
 use crate::shell_indicator::ShellIndicatorType;
@@ -144,8 +144,9 @@ use crate::terminal::shared_session::{
     self, IsSharedSessionCreator, SharedSessionActionSource, SharedSessionSource,
 };
 use crate::terminal::ssh::clone_on_split::{
-    ATTACH_CONTROL_PATH_ENV, SshCloneRequest, clone_request,
+    ATTACH_CONTROL_PATH_ENV, CloneGate, SshCloneRequest, clone_request,
 };
+use crate::terminal::ssh::clone_on_split_telemetry::SshCloneOnSplitTelemetryEvent;
 use crate::terminal::view::inline_banner::{
     ZeroStatePromptSuggestionTriggeredFrom, ZeroStatePromptSuggestionType,
 };
@@ -157,6 +158,7 @@ use crate::terminal::view::{
     BlockNotification, ConversationRestorationInNewPaneType, ExecuteCommandEvent,
     LeftPanelTargetView, SyncEvent, TerminalViewState,
 };
+use crate::terminal::warpify::settings::WarpifySettings;
 use crate::terminal::{
     MockTerminalManager, ShareBlockModal, ShareBlockModalEvent, ShellLaunchData, ShellLaunchState,
     TerminalManager, TerminalModel, TerminalView,
@@ -3999,6 +4001,21 @@ impl PaneGroup {
         new_pane_id
     }
 
+    /// Reads the three conditions the split gate is built from.
+    ///
+    /// Split out so a test can pin that each one comes from its real source. `CloneGate` alone
+    /// proves the rule; only this proves the wiring, and a literal accidentally left in place of
+    /// one of these reads would satisfy the rule while ignoring the user.
+    fn ssh_clone_gate(ctx: &AppContext) -> CloneGate {
+        CloneGate {
+            feature_flag: FeatureFlag::CloneSshOnSplit.is_enabled(),
+            ssh_warpification: *WarpifySettings::as_ref(ctx)
+                .enable_ssh_warpification
+                .value(),
+            setting: *SshSettings::as_ref(ctx).clone_ssh_on_split.value(),
+        }
+    }
+
     /// Whether a split of `source_pane_id` may join that pane's SSH connection, and with what.
     ///
     /// Resolved from the pane actually being split, never from the active session: those diverge
@@ -4018,11 +4035,38 @@ impl PaneGroup {
         // The new pane spawns the shell chosen for it, so that shell's distro is the distro the
         // socket would have to be reachable from.
         let target_wsl_distro = chosen_shell.and_then(AvailableShell::wsl_distro);
-        clone_request(
+        // Warpification is the load-bearing conjunct, not a courtesy: a pane spawned with the SSH
+        // wrapper off carries `WARP_USE_SSH_WRAPPER=0`, so its bootstrap never calls
+        // `warp_ssh_helper` and never reads `ATTACH_CONTROL_PATH_ENV`. The replayed `ssh` would
+        // run as a plain command and dial the host itself, prompting for the credentials this
+        // whole feature exists to avoid. The setting alone cannot stand in for it: turning
+        // warpification off leaves `clone_ssh_on_split` set, because the page only disables its
+        // switch rather than clearing the value. `reuse_existing_control_master` guards itself the
+        // same way at `terminal_manager.rs`.
+        //
+        // The flag wins over both by construction: any one of them off yields `Disabled`, and the
+        // flag additionally keeps the setting off the settings page entirely.
+        match clone_request(
             &source,
             target_wsl_distro.as_deref(),
-            FeatureFlag::CloneSshOnSplit.is_enabled(),
-        )
+            Self::ssh_clone_gate(ctx).is_open(),
+        ) {
+            Ok(request) => {
+                send_telemetry_from_ctx!(SshCloneOnSplitTelemetryEvent::Requested, ctx);
+                Some(request)
+            }
+            Err(declined) => {
+                if declined.is_fallback() {
+                    send_telemetry_from_ctx!(
+                        SshCloneOnSplitTelemetryEvent::Declined {
+                            reason: declined.telemetry_reason(),
+                        },
+                        ctx
+                    );
+                }
+                None
+            }
+        }
     }
 
     /// Adds a terminal split pane without applying the user's default session mode.
@@ -6860,7 +6904,7 @@ impl PaneGroup {
         if let Some(request) = ssh_clone_request {
             view.update(ctx, |terminal_view, ctx| {
                 terminal_view.set_pending_command_queue(vec![request.command], ctx);
-                terminal_view.set_pending_remote_cwd(request.remote_cwd);
+                terminal_view.set_pending_ssh_clone(request.remote_cwd);
                 // Entering agent view now would put a conversation over a pane that is still
                 // submitting `ssh`, so the user would be talking to an agent on their laptop while
                 // the pane authenticates to a remote host. Defer it the way the tab-config path

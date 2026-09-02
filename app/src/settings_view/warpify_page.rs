@@ -30,7 +30,7 @@ use super::{SettingsAction, SettingsSection, ToggleSettingActionPair, flags};
 use crate::appearance::Appearance;
 use crate::send_telemetry_from_ctx;
 use crate::server::telemetry::TelemetryEvent;
-use crate::settings::{ReuseExistingSshControlMaster, SshSettings};
+use crate::settings::{CloneSshOnSplit, ReuseExistingSshControlMaster, SshSettings};
 use crate::terminal::warpify::settings::{
     EnableSshWarpification, SshExtensionInstallMode, SshExtensionInstallModeSetting,
     WarpifySettings, WarpifySettingsChangedEvent,
@@ -69,6 +69,7 @@ const ITEM_VERTICAL_SPACING: f32 = 24.;
 const BUILT_IN_TEXT_INPUT_MARGIN: f32 = 10.;
 const SPACE_AFTER_TEXT_INPUT: f32 = ITEM_VERTICAL_SPACING - BUILT_IN_TEXT_INPUT_MARGIN;
 
+const SSH_CLONE_ON_SPLIT_DESCRIPTION: &str = "Split a pane that holds a warpified SSH session and the new pane joins that same connection, in the same remote directory, without authenticating again. Splits of local panes are unaffected.";
 const SSH_REUSE_CONTROL_MASTER_DESCRIPTION: &str = "Attach to a live SSH ControlMaster you already have configured for the destination host instead of creating a Warp-owned one. Takes effect in new tabs.";
 
 const SSH_EXTENSION_INSTALL_MODE_DESCRIPTION: &str = "Controls the installation behavior for Warp's SSH extension when a remote host doesn't have it installed.";
@@ -162,9 +163,19 @@ impl WarpifyPageView {
             .enable_ssh_warpification
             .is_supported_on_current_platform()
         {
+            let mut ssh_widgets: Vec<Box<dyn SettingsWidget<View = Self>>> =
+                vec![Box::new(SSHWidget::default())];
+            // Its own widget, built only when the flag is on, rather than a row hidden inside
+            // `SSHWidget::render`: a widget is the smallest unit settings search can filter, so a
+            // hidden row under advertised search terms would make the page match a query and then
+            // show nothing for it. A feature flag is fixed for the process, so build-time is the
+            // right moment to decide.
+            if FeatureFlag::CloneSshOnSplit.is_enabled() {
+                ssh_widgets.push(Box::new(SshCloneOnSplitWidget::default()));
+            }
             categories.push(Category::with_header(
                 CategoryHeader::new("SSH").with_subtitle("Warpify your interactive SSH sessions."),
-                vec![Box::new(SSHWidget::default())],
+                ssh_widgets,
             ));
         }
         PageType::new_categorized(categories, None)
@@ -373,6 +384,8 @@ pub enum WarpifyPageAction {
     /// Toggles whether the legacy SSH wrapper attaches to an existing
     /// ControlMaster for the destination host instead of creating its own.
     ToggleReuseSshControlMaster,
+    /// Toggles whether splitting a warpified SSH pane opens the new pane on the same connection.
+    ToggleCloneSshOnSplit,
     /// Set the SSH extension installation mode (always ask / always install / always skip).
     SetSshExtensionInstallMode(SshExtensionInstallMode),
     OpenUrl(String),
@@ -426,6 +439,18 @@ impl TypedActionView for WarpifyPageView {
                                 .reuse_existing_control_master
                                 .value()
                                 .to_string(),
+                        },
+                        ctx
+                    );
+                });
+            }
+            ToggleCloneSshOnSplit => {
+                SshSettings::handle(ctx).update(ctx, |ssh_settings, ctx| {
+                    report_if_error!(ssh_settings.clone_ssh_on_split.toggle_and_save_value(ctx));
+                    send_telemetry_from_ctx!(
+                        TelemetryEvent::FeaturesPageAction {
+                            action: "ToggleCloneSshOnSplit".to_string(),
+                            value: ssh_settings.clone_ssh_on_split.value().to_string(),
                         },
                         ctx
                     );
@@ -747,6 +772,97 @@ impl SettingsWidget for SSHWidget {
     }
 }
 
+#[derive(Default)]
+struct SshCloneOnSplitWidget {
+    switch_state: SwitchStateHandle,
+    local_only_icon_tooltip_states: RefCell<HashMap<String, MouseStateHandle>>,
+}
+
+impl SettingsWidget for SshCloneOnSplitWidget {
+    type View = WarpifyPageView;
+
+    /// Its own terms rather than `SSHWidget`'s: a user looking for this reaches for what it does
+    /// to a split, not for the word "warpify".
+    ///
+    /// "splitting" rather than "split" because the match is a plain substring test over this
+    /// string and never consults the rendered label: the row reads "when splitting a pane", and
+    /// the longer form still answers a query of "split".
+    fn search_terms(&self) -> &str {
+        "warpify ssh splitting pane connection reuse controlmaster remote"
+    }
+
+    fn render(
+        &self,
+        _view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let mut column = Flex::column();
+        let ui_builder = appearance.ui_builder();
+        let description_text_color = appearance
+            .theme()
+            .sub_text_color(appearance.theme().surface_2());
+
+        // Cloning replays the `ssh` through the Warp wrapper, so it cannot work in a pane whose
+        // sessions are not warpified in the first place.
+        let enable_ssh_warpification = *WarpifySettings::as_ref(app)
+            .enable_ssh_warpification
+            .value();
+        let clone_ssh_on_split = *SshSettings::as_ref(app).clone_ssh_on_split.value();
+
+        add_setting(
+            &mut column,
+            &SshSettings::as_ref(app).clone_ssh_on_split,
+            move || {
+                let mut column = Flex::column();
+                column.add_child(render_body_item::<WarpifyPageAction>(
+                    "Reuse the SSH connection when splitting a pane".into(),
+                    None,
+                    LocalOnlyIconState::for_setting(
+                        CloneSshOnSplit::storage_key(),
+                        CloneSshOnSplit::sync_to_cloud(),
+                        &mut self.local_only_icon_tooltip_states.borrow_mut(),
+                        app,
+                    ),
+                    enable_ssh_warpification.into(),
+                    appearance,
+                    ui_builder
+                        .switch(self.switch_state.clone())
+                        .check(clone_ssh_on_split)
+                        .with_disabled(!enable_ssh_warpification)
+                        .build()
+                        .on_click(move |ctx, _, _| {
+                            if !enable_ssh_warpification {
+                                return;
+                            }
+                            ctx.dispatch_typed_action(WarpifyPageAction::ToggleCloneSshOnSplit);
+                        })
+                        .finish(),
+                    None,
+                ));
+                column.add_child(
+                    ui_builder
+                        .paragraph(SSH_CLONE_ON_SPLIT_DESCRIPTION.to_owned())
+                        .with_style(UiComponentStyles {
+                            font_color: Some(description_text_color.into_solid()),
+                            margin: Some(
+                                Coords::default()
+                                    .top(styles::DESCRIPTION_NEGATIVE_MARGIN_OFFSET)
+                                    .bottom(styles::DESCRIPTION_LINE_MARGIN_BOTTOM),
+                            ),
+                            ..Default::default()
+                        })
+                        .build()
+                        .finish(),
+                );
+                column.finish()
+            },
+        );
+
+        column.finish()
+    }
+}
+
 mod styles {
     // Apply a negative margin to the description text so it appears closer to the main
     // settings option text.
@@ -755,3 +871,7 @@ mod styles {
     /// The space after a description.
     pub const DESCRIPTION_LINE_MARGIN_BOTTOM: f32 = 18.;
 }
+
+#[cfg(test)]
+#[path = "warpify_page_tests.rs"]
+mod tests;

@@ -49,17 +49,101 @@ pub struct SshCloneFacts {
     pub remote_cwd: Option<String>,
 }
 
-/// The clone request for a split of `source`, or `None` to fall back to an ordinary local split.
+/// Why a split fell back to an ordinary local pane instead of joining its source's connection.
+///
+/// Every one of these is an *app-side* refusal, decided from fields already on the source session.
+/// A clone this module approves can still end at a local pane: the wrapper re-runs `ssh -O check`
+/// and fails closed on a master that has gone away, and no variant here describes that. Success is
+/// therefore not this module's to report — see `SshCloneOnSplitTelemetryEvent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloneDeclined {
+    /// The feature flag or the user's setting is off.
+    Disabled,
+    /// The source pane held a local shell.
+    NotWarpifiedRemote,
+    /// The source was warpified by the RC-file snippet inside an unwrapped `ssh`, so it carries
+    /// no socket to attach to.
+    NoWrapperSocket,
+    /// The master would be torn down with the source pane, severing the split when that pane
+    /// closed.
+    MasterWouldNotOutliveSource,
+    /// The socket lives inside a WSL distro the new pane cannot reach.
+    WslDistroMismatch,
+    /// No `ssh` command is bound to the source session, so there is nothing to replay.
+    NoBoundCommand,
+}
+
+impl CloneDeclined {
+    /// Whether the user split a warpified SSH pane and got a local one anyway.
+    ///
+    /// This is the line the fallback rate is drawn at, and it is deliberately generous: a pane
+    /// with no wrapper socket, or one older than the flag, is a split the user experienced as a
+    /// fallback even though the feature could never have served it. Both stay countable and stay
+    /// separable by reason, so an early dashboard can subtract the populations it cannot reach.
+    /// Below this line the split was never a candidate at all — the feature is off, or the pane
+    /// held a local shell — and counting those would drown the rate in ordinary local splits.
+    ///
+    /// Two further refusals never reach this enum: `PaneGroup::ssh_clone_request` returns before
+    /// calling `clone_request` at all when the split source is not a terminal pane, and when that
+    /// pane has no active session. Both are non-candidates by the same rule.
+    pub fn is_fallback(self) -> bool {
+        !matches!(self, Self::Disabled | Self::NotWarpifiedRemote)
+    }
+
+    /// The stable telemetry name for this reason. Spelled out rather than derived, because a
+    /// rename of a variant must not silently rewrite a dashboard's history.
+    pub fn telemetry_reason(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::NotWarpifiedRemote => "not_warpified_remote",
+            Self::NoWrapperSocket => "no_wrapper_socket",
+            Self::MasterWouldNotOutliveSource => "master_would_not_outlive_source",
+            Self::WslDistroMismatch => "wsl_distro_mismatch",
+            Self::NoBoundCommand => "no_bound_command",
+        }
+    }
+}
+
+/// Every condition that must hold before a split may join its source's connection.
+///
+/// A struct rather than three `bool` arguments because they are interchangeable at a call site and
+/// silently swappable; and a named type rather than an inline `&&` because dropping one conjunct
+/// there would compile, ship the feature to people who never enabled it, and break no test. Adding
+/// a condition here is a compile error at the call site, which is the point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloneGate {
+    /// The rollout flag. Off means the feature is absent, whatever the rest say.
+    pub feature_flag: bool,
+    /// Whether the SSH wrapper is active for new panes. Without it the split's shell never runs
+    /// `warp_ssh_helper`, so it would replay `ssh` as a plain command and dial the host itself.
+    pub ssh_warpification: bool,
+    /// The user's opt-in.
+    pub setting: bool,
+}
+
+impl CloneGate {
+    /// Whether all three hold. Every one is necessary, so there is no precedence between them.
+    pub fn is_open(self) -> bool {
+        self.feature_flag && self.ssh_warpification && self.setting
+    }
+}
+
+/// The clone request for a split of `source`, or the reason to fall back to an ordinary local
+/// split.
 ///
 /// Preferring no clone over a wrong clone is the governing rule: every gate below fails closed.
-/// `enabled` carries the user setting and the feature flag.
+/// `enabled` carries the user setting and the feature flag, already combined — the flag wins by
+/// construction, since either being off yields `Disabled`.
+///
+/// `Ok` means the attach was *requested*, never that it succeeded. The wrapper decides that, and
+/// it decides it after this function has returned.
 pub fn clone_request(
     source: &SshCloneFacts,
     target_wsl_distro: Option<&str>,
     enabled: bool,
-) -> Option<SshCloneRequest> {
+) -> Result<SshCloneRequest, CloneDeclined> {
     if !enabled {
-        return None;
+        return Err(CloneDeclined::Disabled);
     }
 
     // A session mid-login is not yet `WarpifiedRemote`, so this covers "SSH is still
@@ -67,7 +151,7 @@ pub fn clone_request(
     // has to make this decision consciously rather than inheriting "no clone" by default.
     match source.session_type {
         SessionType::WarpifiedRemote { .. } => {}
-        SessionType::Local => return None,
+        SessionType::Local => return Err(CloneDeclined::NotWarpifiedRemote),
     }
 
     // A session warpified by the RC-file snippet inside an unwrapped `ssh` carries no socket.
@@ -77,7 +161,7 @@ pub fn clone_request(
         persist,
     } = &source.wrapper
     else {
-        return None;
+        return Err(CloneDeclined::NoWrapperSocket);
     };
 
     // Attaching to a master that dies with the source pane would sever the split the moment that
@@ -86,17 +170,20 @@ pub fn clone_request(
     // reported `persist` rather than the feature flag matters: `WARP_SSH_CONTROL_PERSIST` is
     // captured at pane spawn, so a pane older than the flag still holds a non-persistent master.
     if !persist && !external_control_master {
-        return None;
+        return Err(CloneDeclined::MasterWouldNotOutliveSource);
     }
 
     // The socket lives inside the source session's WSL distro, so no pane outside it can reach it.
     if source.wsl_distro.as_deref() != target_wsl_distro {
-        return None;
+        return Err(CloneDeclined::WslDistroMismatch);
     }
 
-    Some(SshCloneRequest {
+    Ok(SshCloneRequest {
         socket_path: socket_path.clone(),
-        command: source.bound_command.clone()?,
+        command: source
+            .bound_command
+            .clone()
+            .ok_or(CloneDeclined::NoBoundCommand)?,
         // An unknown or unsubmittable directory costs the split nothing: the new pane lands in the
         // remote default, which is where a fresh `ssh` would have put it anyway.
         remote_cwd: source

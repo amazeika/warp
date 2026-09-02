@@ -10264,7 +10264,7 @@ mod ssh_clone_split_remote_directory {
 
     fn arm(terminal: &ViewHandle<TerminalView>, app: &mut App, remote_cwd: &str) {
         terminal.update(app, |view, _ctx| {
-            view.set_pending_remote_cwd(Some(remote_cwd.to_owned()));
+            view.set_pending_ssh_clone(Some(remote_cwd.to_owned()));
         });
     }
 
@@ -10307,6 +10307,13 @@ mod ssh_clone_split_remote_directory {
 
     fn pending_remote_cwd(terminal: &ViewHandle<TerminalView>, app: &App) -> Option<String> {
         terminal.read(app, |view, _ctx| view.pending_remote_cwd.clone())
+    }
+
+    /// Whether the pane is still waiting to find out how its attach attempt ended. Its clearing
+    /// is what emits the outcome telemetry, so these tests pin that transition rather than the
+    /// send itself.
+    fn awaiting_ssh_clone(terminal: &ViewHandle<TerminalView>, app: &App) -> bool {
+        terminal.read(app, |view, _ctx| view.awaiting_ssh_clone)
     }
 
     /// The pending directory reaching the input is only half the criterion — `set_pending_command`
@@ -10403,6 +10410,131 @@ mod ssh_clone_split_remote_directory {
         })
     }
 
+    /// The clone succeeded: the wrapper only warpifies once it is through `ssh -O check` and
+    /// attached, so this is the first moment anything in the app knows the attach worked.
+    #[test]
+    fn resolves_the_attach_attempt_when_the_replayed_ssh_warpifies() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+            allow_command_execution(&terminal, &mut app);
+            arm(&terminal, &mut app, REMOTE_CWD);
+            assert!(awaiting_ssh_clone(&terminal, &app));
+
+            bootstrap_remote(&terminal, &mut app);
+
+            assert_eventually!(
+                !awaiting_ssh_clone(&terminal, &app),
+                "a warpified remote session is the clone succeeding, and resolves the attempt"
+            );
+        })
+    }
+
+    /// A clone whose source pane reported no remote directory is still a clone. `pending_remote_cwd`
+    /// is legitimately `None` here, which is exactly why it cannot double as the marker for one.
+    #[test]
+    fn tracks_an_attach_attempt_that_carries_no_remote_directory() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+            terminal.update(&mut app, |view, _ctx| view.set_pending_ssh_clone(None));
+
+            assert!(
+                awaiting_ssh_clone(&terminal, &app),
+                "an unknown source directory is not a reason to stop tracking the attempt"
+            );
+            assert_eq!(pending_remote_cwd(&terminal, &app), None);
+
+            bootstrap_remote(&terminal, &mut app);
+
+            assert_eventually!(
+                !awaiting_ssh_clone(&terminal, &app),
+                "the attempt resolves on the remote bootstrap whether or not it carried a directory"
+            );
+        })
+    }
+
+    /// A cloned split's local shell bootstraps before its `ssh` does. That is not the outcome the
+    /// attempt is waiting for, and resolving it there would report every clone as succeeding.
+    #[test]
+    fn does_not_resolve_the_attach_attempt_on_the_local_bootstrap() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+            arm(&terminal, &mut app, REMOTE_CWD);
+
+            bootstrap_local(&terminal, &mut app);
+
+            assert_eventually!(
+                terminal.read(&app, |view, _ctx| view.is_login_shell_bootstrapped),
+                "The local session never bootstrapped"
+            );
+            assert!(
+                awaiting_ssh_clone(&terminal, &app),
+                "the remote session that follows is what decides the attempt"
+            );
+        })
+    }
+
+    /// The pane's shell exiting mid-connect is its own outcome. Losing this clear would leave the
+    /// attempt armed, so a later session restarted in the same pane would report a success it
+    /// never had and enter a directory named by a different host.
+    #[test]
+    fn resolves_the_attach_attempt_when_the_pane_shell_exits() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+            arm(&terminal, &mut app, REMOTE_CWD);
+
+            // The pane's own local shell comes up first, exactly as it does for a real clone; the
+            // `Exit` arm reads models that only exist once it has.
+            bootstrap_local(&terminal, &mut app);
+            assert_eventually!(
+                terminal.read(&app, |view, _ctx| view.is_login_shell_bootstrapped),
+                "The local session never bootstrapped"
+            );
+            assert!(
+                awaiting_ssh_clone(&terminal, &app),
+                "the local bootstrap is not the outcome the attempt is waiting for"
+            );
+
+            terminal.update(&mut app, |view, ctx| {
+                view.handle_terminal_event(
+                    &ModelEvent::Exit {
+                        reason: ExitReason::ShellProcessExited,
+                    },
+                    ctx,
+                );
+            });
+
+            assert!(
+                !awaiting_ssh_clone(&terminal, &app),
+                "a shell that exited cannot still be attaching"
+            );
+            assert_eq!(pending_remote_cwd(&terminal, &app), None);
+        })
+    }
+
+    /// The fallback: the replayed `ssh` finished without warpifying, so the pane is back at a
+    /// local prompt and the attempt is over.
+    #[test]
+    fn resolves_the_attach_attempt_when_the_replayed_ssh_ends_without_warpifying() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+            arm(&terminal, &mut app, REMOTE_CWD);
+
+            end_attach_attempt(&terminal, &mut app);
+
+            assert!(!awaiting_ssh_clone(&terminal, &app));
+        })
+    }
+
     /// Regression for a review finding: the wrapper fails closed on a dead master, so the
     /// replayed `ssh` can complete without ever warpifying and leave the pane at its local
     /// prompt. A directory named by the source host must not still be waiting there — the user's
@@ -10490,7 +10622,7 @@ mod ssh_clone_split_remote_directory {
             allow_command_execution(&terminal, &mut app);
             terminal.update(&mut app, |view, ctx| {
                 view.set_pending_command_queue(vec![SSH_COMMAND.to_owned()], ctx);
-                view.set_pending_remote_cwd(Some(REMOTE_CWD.to_owned()));
+                view.set_pending_ssh_clone(Some(REMOTE_CWD.to_owned()));
             });
 
             bootstrap_remote(&terminal, &mut app);
