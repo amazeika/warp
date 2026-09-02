@@ -3,7 +3,7 @@ status: in-progress
 issue: 5409
 tracking: amazeika/warp#1
 pr: null
-completed: [1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13]
+completed: [1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 13]
 ---
 
 # Reuse the SSH connection when splitting a pane — Design Document
@@ -1252,4 +1252,53 @@ exists for.
 
 ## Outcome
 
-<!-- Build fills this after implementation, including the full-sweep result. Keep it brief. -->
+Splitting a pane that holds a warpified SSH session established by the Warp wrapper now opens the
+new pane on that same connection, in the same remote directory, with no authentication prompt. It
+ships off: both the `CloneSshOnSplit` flag and the `clone_ssh_on_split` setting default to off.
+
+The path, end to end: the bundled wrappers attach to a supplied master rather than create one when
+`WARP_SSH_ATTACH_CONTROL_PATH` names a live socket (Phase 1); Warp-owned masters carry
+`ControlPersist=60`, so the connection outlives the foreground `ssh` that created it (Phase 2); each
+warpified session remembers the `ssh` command that created it (Phase 3); `split_terminal_pane` turns
+that into a clone request for the pane being split (Phase 4), whose new pane `cd`s to the source
+pane's remote directory (Phase 5). The request is gated on warpification, the flag, the setting, and
+the source master outliving the source pane (Phases 4 and 6), and every decline falls back to
+today's local pane.
+
+Connection lifetime was the harder half, and cost three phases the design did not foresee.
+`ControlPersist` only helps if the idle timer starts, and Warp's own remote-server proxy kept it
+from starting: `deregister_session` has exactly one non-failure caller, the remote `ExitShell` hook,
+which an abruptly closed pane never sends. Phase 10 releases that client from the local-shell-exit
+backstop instead. Phase 12 covers what Phase 10 could not reach — a closed window, whose panes leave
+`Workspace::tabs` and `AppContext::windows` before anything can release them — by staging their
+sessions on the undo stack and releasing only once the window proves unrestorable. Phase 12 also
+ties `ControlPersist` to the setting, so a user who declined the feature stops paying for masters
+that outlive their `ssh`.
+
+**Deviations that changed the design's shape:**
+
+- The clone boundary is `split_terminal_pane` and the source is the pane being split, not generic
+  pane creation and not the active session (Phase 4).
+- The attach is gated on the source master's reported survival — `persist || external_control_master`
+  — rather than on the flag, so a stale pane degrades instead of severing its split (Phase 4).
+- Warpification joined the gate; without it a clone could still prompt for credentials (Phase 6).
+- Phase 6 deliberately left the setting out of `WARP_SSH_CONTROL_PERSIST`; Phase 12 reversed that
+  once the cost of gating at spawn turned out to be one `PtyOptions` field.
+- A pre-existing Fish quoting bug in `warp_terminal` was fixed rather than worked around (Phase 5),
+  and `AppContext::close_window_for_test` was added to `warpui_core` behind its existing test-util
+  feature, without which no test here could close a window at all (Phase 12).
+
+**Deferred to follow-up issues:** new tab and new window from an SSH pane; empirical Windows/WSL
+correctness, where the plumbing is confirmed reachable but the hardware was not available; and a
+specific message for `sshd` `MaxSessions` exhaustion, if the generic failure proves confusing.
+
+**Full sweep (Phase 13):** the union of test paths declared by every completed phase is green on the
+Phase 12 tree — 18 gates, 552 tests, no failures and no remediation. Phases 7 and 11 were likewise
+green at their own trees.
+
+**Still outstanding:** none of Section 4 has been run. That verification needs a key-based and a
+password-only host — and, for the Windows/WSL rows, hardware — that this work was not developed on,
+and it is the only evidence that the no-second-prompt claim holds against a real server rather than
+against the wrapper's fail-closed paths. `./script/presubmit` and the narrated screen recording for
+the upstream PR are outstanding for the same reason: presubmit's integration tests tunnel to Warp's
+private GCP project, so they are not runnable here.
