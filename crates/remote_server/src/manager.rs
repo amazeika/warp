@@ -1304,6 +1304,31 @@ struct SessionBootstrapInfo {
 /// remote host. The `HostId` returned by the server's `InitializeResponse`
 /// is used on the client to deduplicate host-scoped models (e.g.
 /// `RepoMetadataModel`), not connections.
+/// What teardown should do with the session's SSH `ControlMaster`.
+#[derive(Clone, Copy)]
+enum MasterDisposition {
+    /// Run `ssh -O exit` against a non-persistent Warp-owned master, per
+    /// [`crate::ssh::stop_control_master`]'s rules. For a caller that has
+    /// observed the user's shell exit.
+    ForceExitIfWarpOwned,
+    /// Leave the master to its own idle timeout. For a caller that only knows
+    /// the pane is gone.
+    LeaveRunning,
+}
+
+impl MasterDisposition {
+    /// Whether teardown should ask the master to exit.
+    ///
+    /// Split out from the teardown so the rule can be tested: the force-exit
+    /// itself is a detached background task, which a test cannot observe.
+    fn force_exits(self) -> bool {
+        match self {
+            Self::ForceExitIfWarpOwned => true,
+            Self::LeaveRunning => false,
+        }
+    }
+}
+
 pub struct RemoteServerManager {
     /// Per-session connection state. Each SSH session gets its own dedicated
     /// connection to the remote server.
@@ -2395,11 +2420,83 @@ impl RemoteServerManager {
     ///   requests. The same event also fires independently from
     ///   `mark_session_disconnected` when the stream drops on its own.
     /// * `SessionDeregistered` -- the manager is no longer *tracking* this
-    ///   session. Always emitted, regardless of which state the session
-    ///   was in, because the entry is being removed from `sessions`
-    ///   outright. Unlike `SessionDisconnected`, this one never fires for
-    ///   spontaneous drops -- only for explicit teardown.
+    ///   session. Emitted whenever the manager held any state for it,
+    ///   regardless of which state that was. It does not fire for a session
+    ///   the manager was not tracking at all, because there is nothing to
+    ///   stop tracking; that is what makes a second teardown safe. Unlike
+    ///   `SessionDisconnected`, this one never fires for spontaneous drops
+    ///   -- only for explicit teardown.
     pub fn deregister_session(&mut self, session_id: SessionId, ctx: &mut ModelContext<Self>) {
+        self.take_tracked_session(session_id, MasterDisposition::ForceExitIfWarpOwned, ctx);
+    }
+
+    /// Whether the manager holds any state for `session_id`.
+    ///
+    /// Checks the side maps as well as `sessions`, because
+    /// `mark_session_disconnected` removes the `sessions` entry on its own and
+    /// leaves them behind.
+    pub fn tracks_session(&self, session_id: SessionId) -> bool {
+        self.sessions.contains_key(&session_id)
+            || self.last_navigation.contains_key(&session_id)
+            || self.session_bootstrap_info.contains_key(&session_id)
+            || self.session_platforms.contains_key(&session_id)
+            || self.session_labels.contains_key(&session_id)
+    }
+
+    /// Records `session_id` as mid-handshake, for tests that need a session the
+    /// manager tracks without standing up a real connection.
+    pub fn seed_connecting_session_for_test(&mut self, session_id: SessionId) {
+        self.sessions
+            .insert(session_id, RemoteSessionState::Connecting);
+    }
+
+    /// Records only the side-map state that `mark_session_disconnected` leaves
+    /// behind, for tests covering a session already absent from `sessions`.
+    pub fn seed_session_label_for_test(&mut self, session_id: SessionId) {
+        self.session_labels
+            .insert(session_id, "test-host".to_string());
+    }
+
+    /// Releases Warp's own multiplexed client for `session_id` without asking
+    /// the SSH `ControlMaster` to exit.
+    ///
+    /// This is the teardown for a caller that knows the *pane* is gone but has
+    /// not observed `ExitShell` — a closed pane, or a local shell that died
+    /// without the remote hook ever arriving. Dropping the session's
+    /// `ssh … remote-server-proxy` child is the load-bearing part: until that
+    /// client is gone, `ControlPersist`'s idle timeout never starts counting,
+    /// so a persistent Warp-owned master would otherwise stay authenticated
+    /// for the rest of the process's life.
+    ///
+    /// Leaving the master alone is deliberate. A persistent master is meant to
+    /// outlive its pane so a split can still be attached to it, and a
+    /// `UserOwned` one was never ours to stop; both are then reaped by the
+    /// idle timeout once this was the last client.
+    pub fn release_session_client(&mut self, session_id: SessionId, ctx: &mut ModelContext<Self>) {
+        self.take_tracked_session(session_id, MasterDisposition::LeaveRunning, ctx);
+    }
+
+    /// Removes every trace of `session_id` and, per `disposition`, force-exits
+    /// its master.
+    ///
+    /// Returns without touching anything — and without emitting — when the
+    /// session is not tracked at all. That guard is what makes a second
+    /// release safe: `SessionDeregistered` announces that the manager stopped
+    /// tracking a session, so firing it again for a session it already forgot
+    /// would be a lie. Membership is checked across the side maps too, because
+    /// `mark_session_disconnected` removes the `sessions` entry on its own and
+    /// leaves those behind.
+    #[cfg_attr(target_family = "wasm", allow(unused_variables))]
+    fn take_tracked_session(
+        &mut self,
+        session_id: SessionId,
+        disposition: MasterDisposition,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if !self.tracks_session(session_id) {
+            return;
+        }
+
         self.last_navigation.remove(&session_id);
         self.session_bootstrap_info.remove(&session_id);
         self.session_platforms.remove(&session_id);
@@ -2451,11 +2548,13 @@ impl RemoteServerManager {
         // the ssh subcommand may take a moment to complete and we don't
         // want to block the main thread on it.
         #[cfg(not(target_family = "wasm"))]
-        ctx.background_executor()
-            .spawn(async move {
-                crate::ssh::stop_control_master(&control_path).await;
-            })
-            .detach();
+        if disposition.force_exits() {
+            ctx.background_executor()
+                .spawn(async move {
+                    crate::ssh::stop_control_master(&control_path).await;
+                })
+                .detach();
+        }
     }
 
     /// Returns the client for this session, if connected.

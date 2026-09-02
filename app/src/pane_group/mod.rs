@@ -7990,12 +7990,20 @@ impl PaneGroup {
 
     /// Detach all panes and clean up associated state when closing a tab.
     /// This should be called instead of `detach_panes` when the pane group is being destroyed.
+    ///
+    /// `detach_type` says whether the tab can come back. A tab stored on the undo stack is
+    /// restorable, so its panes detach as `HiddenForClose` and keep their state; a tab dropped
+    /// without an undo entry is gone for good, and only `Closed` releases the per-pane resources
+    /// — an SSH session's remote-server client among them — that would otherwise outlive it.
     pub fn detach_panes_for_close(
         &self,
+        detach_type: DetachType,
         working_directories_model: &ModelHandle<WorkingDirectoriesModel>,
         ctx: &mut ViewContext<Self>,
     ) {
-        self.detach_panes(ctx);
+        for pane in self.pane_contents.values() {
+            pane.as_pane().detach(self, detach_type, ctx);
+        }
 
         // Clean up any state associated with this pane group (global search views, etc.)
         let pane_group_id = ctx.view_id();

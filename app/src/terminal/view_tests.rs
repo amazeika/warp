@@ -10237,7 +10237,11 @@ mod ssh_clone_split_remote_directory {
 
     /// Drives a session bootstrap in `terminal`. A hostname unlike the local one is what makes
     /// the resulting session `WarpifiedRemote`, exactly as a real `ssh` does.
-    fn bootstrap_session(terminal: &ViewHandle<TerminalView>, app: &mut App, hostname: &str) {
+    pub(super) fn bootstrap_session(
+        terminal: &ViewHandle<TerminalView>,
+        app: &mut App,
+        hostname: &str,
+    ) {
         terminal.update(app, |view, _ctx| {
             let mut model = view.model.lock();
             model.init_shell(InitShellValue {
@@ -10257,7 +10261,7 @@ mod ssh_clone_split_remote_directory {
         bootstrap_session(terminal, app, "build-host");
     }
 
-    fn bootstrap_local(terminal: &ViewHandle<TerminalView>, app: &mut App) {
+    pub(super) fn bootstrap_local(terminal: &ViewHandle<TerminalView>, app: &mut App) {
         let hostname = get_local_hostname().expect("the test host has a hostname");
         bootstrap_session(terminal, app, &hostname);
     }
@@ -10684,5 +10688,179 @@ mod ssh_clone_split_remote_directory {
                 "pre-existing input must not ride along with the cd"
             );
         })
+    }
+}
+
+/// Releasing the remote-server clients that hold a pane's `ControlMaster`s open (GH5409 Phase 10).
+///
+/// The master itself is never stopped here — a persistent one exists so a split can still be
+/// attached to it. What these pin is that Warp stops being a *client* of it, because until every
+/// client is gone `ControlPersist`'s idle timeout never starts counting.
+mod ssh_wrapper_session_release {
+    use remote_server::manager::RemoteServerManager;
+    use warp_terminal::event::ExitReason;
+
+    use super::ssh_clone_split_remote_directory::bootstrap_local;
+    use super::*;
+    use crate::pane_group::pane::DetachType;
+    use crate::terminal::model::session::SessionInfo;
+    use crate::terminal::view::detach_releases_ssh_sessions;
+
+    fn wrapper_session_info(id: u64) -> SessionInfo {
+        SessionInfo::new_for_test()
+            .with_id(id)
+            .with_ssh_socket_path("/tmp/warp-ssh-socket".into())
+    }
+
+    fn recorded_sessions(terminal: &ViewHandle<TerminalView>, app: &App) -> Vec<SessionId> {
+        terminal.read(app, |view, _ctx| {
+            view.ssh_wrapper_sessions.iter().copied().collect()
+        })
+    }
+
+    /// The manager starts tracking a session before its handshake completes, so a pane closed
+    /// mid-connect still has a proxy child to release. Recording at bootstrap-success binding
+    /// instead would miss exactly that pane.
+    #[test]
+    fn records_a_wrapper_session_when_it_starts() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+
+            terminal.update(&mut app, |view, ctx| {
+                view.handle_terminal_event(
+                    &ModelEvent::SshInitShell {
+                        pending_session_info: Box::new(wrapper_session_info(7)),
+                    },
+                    ctx,
+                );
+            });
+
+            assert_eq!(
+                recorded_sessions(&terminal, &app),
+                vec![SessionId::from(7)],
+                "the session is recorded from the init-shell payload, before any connection exists"
+            );
+        })
+    }
+
+    #[test]
+    fn does_not_record_a_session_without_a_wrapper_socket() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+
+            terminal.update(&mut app, |view, ctx| {
+                view.handle_terminal_event(
+                    &ModelEvent::SshInitShell {
+                        pending_session_info: Box::new(SessionInfo::new_for_test().with_id(7)),
+                    },
+                    ctx,
+                );
+            });
+
+            assert!(
+                recorded_sessions(&terminal, &app).is_empty(),
+                "a session with no wrapper socket has no ControlMaster for this pane to release"
+            );
+        })
+    }
+
+    /// A pane can hold several nested SSH sessions, and every one of them has its own proxy child.
+    #[test]
+    fn releases_every_session_the_pane_started() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let manager = app.add_singleton_model(RemoteServerManager::new);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+            let connecting = SessionId::from(1);
+            let disconnected = SessionId::from(2);
+
+            manager.update(&mut app, |manager, _ctx| {
+                // Still mid-handshake.
+                manager.seed_connecting_session_for_test(connecting);
+                // Already out of `sessions`, but the side maps `mark_session_disconnected` leaves
+                // behind still name it.
+                manager.seed_session_label_for_test(disconnected);
+            });
+            terminal.update(&mut app, |view, ctx| {
+                view.ssh_wrapper_sessions.insert(connecting);
+                view.ssh_wrapper_sessions.insert(disconnected);
+                view.release_ssh_wrapper_sessions(ctx);
+            });
+
+            manager.read(&app, |manager, _ctx| {
+                assert!(
+                    !manager.tracks_session(connecting),
+                    "a session still connecting when its pane went away must still be released"
+                );
+                assert!(
+                    !manager.tracks_session(disconnected),
+                    "every session the pane started is released, not only the live ones"
+                );
+            });
+            assert!(
+                recorded_sessions(&terminal, &app).is_empty(),
+                "a released session is no longer this pane's to release"
+            );
+        })
+    }
+
+    /// `ExitShell` is a remote hook that an abruptly killed shell never sends, so the local shell
+    /// exiting is what releases a pane that stays open.
+    #[test]
+    fn a_local_shell_exit_releases_the_panes_sessions() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let manager = app.add_singleton_model(RemoteServerManager::new);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+            let session_id = SessionId::from(1);
+
+            // The `Exit` arm reads models that only exist once the pane's own shell has come up.
+            bootstrap_local(&terminal, &mut app);
+            assert_eventually!(
+                terminal.read(&app, |view, _ctx| view.is_login_shell_bootstrapped),
+                "The local session never bootstrapped"
+            );
+            manager.update(&mut app, |manager, _ctx| {
+                manager.seed_connecting_session_for_test(session_id);
+            });
+            terminal.update(&mut app, |view, ctx| {
+                view.ssh_wrapper_sessions.insert(session_id);
+                view.handle_terminal_event(
+                    &ModelEvent::Exit {
+                        reason: ExitReason::ShellProcessExited,
+                    },
+                    ctx,
+                );
+            });
+
+            manager.read(&app, |manager, _ctx| {
+                assert!(
+                    !manager.tracks_session(session_id),
+                    "a shell that exits while its pane stays open must still release its session"
+                );
+            });
+        })
+    }
+
+    #[test]
+    fn only_a_permanent_close_releases_the_panes_sessions() {
+        assert!(
+            detach_releases_ssh_sessions(DetachType::Closed),
+            "a permanently closed pane must release, or its ControlMaster never goes idle"
+        );
+        assert!(
+            !detach_releases_ssh_sessions(DetachType::HiddenForClose),
+            "a tab hidden for close is restorable and comes back to the same connection"
+        );
+        assert!(
+            !detach_releases_ssh_sessions(DetachType::Moved),
+            "a moved pane keeps its connection"
+        );
     }
 }

@@ -5025,3 +5025,82 @@ fn test_tools_panel_warp_drive_toggle_updates_available_views() {
         });
     });
 }
+
+/// Releasing a closed tab's SSH sessions (GH5409 Phase 10).
+///
+/// `clean_up_panes` — the only other source of a `Closed` detach for a whole tab — runs solely
+/// when an undo entry expires. A tab removed without an undo entry therefore has exactly one
+/// chance to release the per-pane resources that outlive the view, and these pin that it takes it.
+mod ssh_session_release_on_tab_close {
+    use remote_server::manager::RemoteServerManager;
+
+    use super::*;
+
+    /// Removes the active tab with `add_to_undo_stack`, after recording an SSH session on its
+    /// terminal pane. Returns whether the manager still tracks that session afterwards.
+    fn still_tracked_after_tab_close(add_to_undo_stack: bool) -> bool {
+        let tracked = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let tracked_for_closure = tracked.clone();
+        App::test((), |mut app| {
+            let tracked = tracked_for_closure;
+            async move {
+                initialize_app(&mut app);
+                let manager = RemoteServerManager::handle(&app);
+                let workspace = mock_workspace(&mut app);
+                let session_id = warp_core::SessionId::from(1);
+
+                manager.update(&mut app, |manager, _ctx| {
+                    manager.seed_connecting_session_for_test(session_id);
+                });
+
+                workspace.update(&mut app, |workspace, ctx| {
+                    // A second tab, so removing the first does not close the window instead.
+                    workspace.add_terminal_tab(false, ctx);
+                    let pane_group = workspace.active_tab_pane_group();
+                    pane_group.update(ctx, |pane_group, ctx| {
+                        let terminal_view = pane_group
+                            .terminal_views(ctx)
+                            .into_iter()
+                            .next()
+                            .expect("the new tab has a terminal pane");
+                        terminal_view.update(ctx, |view: &mut TerminalView, _ctx| {
+                            view.record_ssh_wrapper_session_for_test(session_id);
+                        });
+                    });
+                    workspace.remove_tab(
+                        workspace.active_tab_index(),
+                        add_to_undo_stack,
+                        true,
+                        ctx,
+                    );
+                });
+                app.update(|_| ());
+
+                manager.read(&app, |manager, _ctx| {
+                    tracked.store(
+                        manager.tracks_session(session_id),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                });
+            }
+        });
+        tracked.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[test]
+    fn a_tab_closed_without_an_undo_entry_releases_its_sessions() {
+        assert!(
+            !still_tracked_after_tab_close(false),
+            "the tab is dropped outright, so nothing later reaches its panes: without releasing \
+             here the proxy child keeps its ControlMaster alive for the rest of the process"
+        );
+    }
+
+    #[test]
+    fn a_tab_closed_onto_the_undo_stack_keeps_its_sessions() {
+        assert!(
+            still_tracked_after_tab_close(true),
+            "a restorable tab comes back to the same connection, so its sessions must survive"
+        );
+    }
+}

@@ -4068,3 +4068,77 @@ fn ssh_clone_gate_is_closed_while_the_feature_flag_is_off() {
         });
     });
 }
+
+/// The close seam for a pane's SSH sessions (GH5409 Phase 10).
+///
+/// `TerminalView` owns the recorded sessions and the release, and `view_tests.rs` pins that
+/// behavior. What can only be pinned here is the wiring: that the real
+/// `TerminalManager<TerminalView>::on_view_detached` consults the detach type and actually calls
+/// the release. That one line is what the phase hangs on — the `ModelEvent::Exit` backstop is not
+/// delivered on an ordinary close — so without this a refactor could drop it silently.
+mod ssh_session_release_on_detach {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use remote_server::manager::RemoteServerManager;
+    use warp_core::SessionId;
+
+    use super::*;
+
+    /// Seeds a session in the manager, records it on the pane's terminal view, then detaches the
+    /// pane's real manager with `detach_type`. Returns whether the manager still tracks it.
+    fn still_tracked_after_detach(detach_type: DetachType) -> bool {
+        let tracked = Arc::new(AtomicBool::new(true));
+        let tracked_for_closure = tracked.clone();
+        App::test((), |mut app| {
+            let tracked = tracked_for_closure;
+            async move {
+                initialize_app(&mut app);
+                let manager = RemoteServerManager::handle(&app);
+                let pane_group = mock_pane_group(&mut app, Default::default());
+                let session_id = SessionId::from(1);
+
+                manager.update(&mut app, |manager, _ctx| {
+                    manager.seed_connecting_session_for_test(session_id);
+                });
+
+                pane_group.update(&mut app, |pane_group, ctx| {
+                    let terminal_pane = pane_group.terminal_session_by_pane_index(0).unwrap();
+                    terminal_pane.terminal_view(ctx).update(ctx, |view, _ctx| {
+                        view.record_ssh_wrapper_session_for_test(session_id);
+                    });
+                    let terminal_manager_handle = terminal_pane.terminal_manager(ctx);
+                    terminal_manager_handle.update(ctx, |terminal_manager, ctx| {
+                        terminal_manager.on_view_detached(detach_type, ctx);
+                    });
+                });
+
+                manager.read(&app, |manager, _ctx| {
+                    tracked.store(manager.tracks_session(session_id), Ordering::Relaxed);
+                });
+            }
+        });
+        tracked.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn a_permanent_close_releases_through_the_real_detach_seam() {
+        assert!(
+            !still_tracked_after_detach(DetachType::Closed),
+            "on_view_detached must release the pane's sessions on a permanent close, or the \
+             ControlMaster never goes idle"
+        );
+    }
+
+    #[test]
+    fn a_reversible_detach_keeps_the_panes_sessions() {
+        assert!(
+            still_tracked_after_detach(DetachType::HiddenForClose),
+            "a tab hidden for close comes back to the same connection"
+        );
+        assert!(
+            still_tracked_after_detach(DetachType::Moved),
+            "a moved pane keeps its connection"
+        );
+    }
+}

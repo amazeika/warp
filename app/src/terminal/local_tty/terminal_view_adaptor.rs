@@ -66,7 +66,9 @@ use crate::terminal::shared_session::{
     SharedSessionActionSource, SharedSessionScrollbackType, SharedSessionSource,
     SharedSessionStatus, max_session_size,
 };
-use crate::terminal::view::{ConversationRestorationInNewPaneType, Event as TerminalViewEvent};
+use crate::terminal::view::{
+    ConversationRestorationInNewPaneType, Event as TerminalViewEvent, detach_releases_ssh_sessions,
+};
 use crate::terminal::writeable_pty::terminal_manager_util::wire_up_remote_server_controller_with_view;
 use crate::terminal::{TerminalManager as TerminalManagerTrait, TerminalModel, TerminalView};
 use crate::view_components::ToastFlavor;
@@ -1991,12 +1993,26 @@ impl TerminalManagerTrait for TerminalManager<TerminalView> {
 
     fn on_view_detached(
         &self,
-        // The detach type is intentionally ignored: a sharer always stops sharing immediately,
-        // even on a reversible `HiddenForClose` detach. This is desirable for security — a sharer
-        // should not continue accepting commands from viewers while the session is not visible.
+        // The detach type is intentionally ignored by the shared-session branch below: a sharer
+        // always stops sharing immediately, even on a reversible `HiddenForClose` detach. This is
+        // desirable for security — a sharer should not continue accepting commands from viewers
+        // while the session is not visible.
         detach_type: crate::pane_group::pane::DetachType,
         app: &mut AppContext,
     ) {
+        // A permanently closed pane releases its SSH sessions here, and only here. The
+        // `ModelEvent::Exit` backstop cannot cover this: the event loop pushes `Exit` without a
+        // wakeup on the way down, and its consumer is a task owned by the pane graph that is
+        // already being dropped. The proxy child, by contrast, is owned by the singleton
+        // `RemoteServerManager`, which outlives the pane — so without this, its `ControlMaster`
+        // never goes idle. Done synchronously because, as this method's contract warns, an event
+        // emitted here may never be processed. A reversible detach releases nothing: the pane is
+        // coming back to the same connection.
+        if detach_releases_ssh_sessions(detach_type) {
+            self.view
+                .update(app, |view, ctx| view.release_ssh_wrapper_sessions(ctx));
+        }
+
         let shared_session_status = self.model.lock().shared_session_status().clone();
         if shared_session_status.is_sharer() {
             Self::log_shared_session_lifecycle(

@@ -3,7 +3,7 @@ status: in-progress
 issue: 5409
 tracking: amazeika/warp#1
 pr: null
-completed: [1, 2, 3, 4, 5, 6, 7]
+completed: [1, 2, 3, 4, 5, 6, 7, 10]
 ---
 
 # Reuse the SSH connection when splitting a pane — Design Document
@@ -843,6 +843,132 @@ it lands when the PR is opened.
 - [ ] The union of test paths declared by completed phases passes through the scoped resolver.
 - [ ] Failures surfaced by the sweep are remediated in this phase.
 
+### Phase 10: Release the remote-server proxy when a pane goes away
+
+**ID:** `10`
+**Goal:** a persistent Warp-owned master's `ControlPersist` idle timer actually starts when its pane
+goes away, so a closed pane cannot hold an authenticated connection open for the rest of the Warp
+process's life
+**Tests:** `app/src/terminal/view_tests.rs`, `app/src/pane_group/mod_tests.rs`, `app/src/workspace/view_tests.rs`, `crates/remote_server/src/manager_tests.rs`, `crates/remote_server/src/ssh_tests.rs`
+
+**Acceptance criteria:**
+
+- [x] `RemoteServerManager` gains an idempotent release entry point that drops the session's
+      `ssh … remote-server-proxy` child and clears its tracked state, never force-exits any master,
+      and emits nothing when that session has nothing left tracked.
+- [x] "Nothing left tracked" accounts for the side maps `mark_session_disconnected` leaves behind:
+      a session already absent from `sessions` but still present in `session_bootstrap_info`,
+      `session_labels`, `session_platforms`, or `last_navigation` is still cleaned
+      ([manager.rs:2435-2437](../../crates/remote_server/src/manager.rs#L2435-L2437)).
+- [x] Closing a pane releases every session that pane started, including one still connecting, so
+      no proxy child outlives the pane.
+- [x] The pane records a session's identity when its wrapper session starts, not when the command
+      binds at bootstrap success, so a pane closed mid-connect is covered.
+- [x] A pane whose shell exits while the pane itself stays open releases the same way.
+- [x] A reversible detach — the tab-restore and pane-move cases — releases nothing.
+- [x] A tab removed without an undo entry releases its panes' sessions; a tab removed onto the undo
+      stack keeps them.
+- [x] A persistent Warp-owned master is left to its idle timeout rather than force-exited, and a
+      `UserOwned` master (the source socket a split pane holds) is never force-exited. A split pane
+      still attached survives its source pane's close.
+- [x] Releasing a session twice — a close after `ExitShell`, or a shell exit then a close — emits no
+      duplicate `SessionDeregistered`.
+
+**Why this phase exists:** Section 2 rejected an attached-client check as "reintroduces refcount
+bookkeeping", on the premise that a master Warp stops force-exiting is reaped by its idle timeout.
+Phase 7's review confirmed the premise is wrong. `deregister_session` is reached only from
+`ModelEvent::ExitShell` ([view.rs:13072-13090](../../app/src/terminal/view.rs#L13072-L13090)), and
+the `sessions` map's only other removals are the connection-failure and disconnect paths
+([manager.rs:2169](../../crates/remote_server/src/manager.rs#L2169),
+[:3937](../../crates/remote_server/src/manager.rs#L3937)). `ExitShell` is a *remote* DCS hook, so a
+pane closed abruptly never delivers it; the manager keeps the session entry, `kill_on_drop` never
+fires, Warp's own proxy stays attached, and the idle timer never starts. The master survives until
+Warp exits.
+
+This phase adds no refcounting. It releases Warp's own client and leaves the counting to `ssh`,
+which does it correctly. It also bounds the port-forwarding window in the same question's third
+bullet: a `-L`/`-R`/`-D` session's listeners now expire one idle timeout after the pane closes
+rather than at Warp exit.
+
+**Seam, and why not the obvious one.** A doubt pass rejected the first candidate. The
+`ModelEvent::Exit` arm that already backstops `release_bound_ssh_command`
+([view.rs:11947-11951](../../app/src/terminal/view.rs#L11947-L11951)) is *not delivered* on an
+ordinary pane close: the event loop's last act pushes `Exit` without a wakeup
+([event_loop.rs:494](../../crates/warp_terminal/src/local_tty/event_loop.rs#L494), unlike
+[:409](../../crates/warp_terminal/src/local_tty/event_loop.rs#L409)), and the consumer is a
+`spawn_stream_local` task owned by the `ModelEventDispatcher`
+([model_events.rs:68-72](../../app/src/terminal/model_events.rs#L68-L72)) — part of the pane graph
+being dropped. `release_bound_ssh_command` survives that because its state is pane-local and dies
+with the view; the proxy `Child` is held by the singleton manager, which outlives the pane. So the
+primary seam is the guaranteed close path, `on_view_detached` with `DetachType::Closed`
+([terminal_manager.rs:29-34](../../app/src/terminal/terminal_manager.rs#L29-L34)), whose contract
+warns that emitted events may not be processed before the window closes — which is why the release
+must drop the child synchronously rather than rely on an event. The `Exit` arm keeps an identically
+guarded release for the case it *does* cover: a shell that dies while its pane stays open.
+
+Review found that `Closed` is narrower than it looks, and the phase widened to match.
+`clean_up_panes` — the only source of a `Closed` detach for a whole tab — runs solely when an undo
+entry expires ([stack.rs:148](../../app/src/undo_close/stack.rs#L148)), while `detach_panes_for_close`
+detached every pane as `HiddenForClose` regardless of whether the tab could come back. A tab removed
+with `add_to_undo_stack=false` was therefore dropped outright with its panes never released — the
+path both tab-replacement flows take
+([view.rs:2386](../../app/src/workspace/view.rs#L2386),
+[:10880](../../app/src/workspace/view.rs#L10880)). `detach_panes_for_close` now takes the detach type
+from its caller ([mod.rs:7998](../../app/src/pane_group/mod.rs#L7998)), and `remove_tab` picks it
+from whether the tab is restorable ([view.rs:12130](../../app/src/workspace/view.rs#L12130)).
+
+**Why not reuse `deregister_session`.** Its documented contract assumes the caller has already
+observed `ExitShell` ([manager.rs:2386-2388](../../crates/remote_server/src/manager.rs#L2386-L2388)),
+and under that assumption it force-exits the master with `ssh -O exit` — necessary there because the
+master is the user's interactive `ssh`, which otherwise hangs waiting on multiplexed channels. A
+pane going away is not that: the master may still be carrying another pane's session, so the new
+callers must not force-exit. Both now route through one teardown that takes a `MasterDisposition`
+([:1324](../../crates/remote_server/src/manager.rs#L1324)), which is the only thing that differs
+between them; sharing it also gave `deregister_session` the same tracked-session guard, so a second
+teardown is a no-op either way.
+
+**Delivered.** The release entry point is `RemoteServerManager::release_session_client`; it and
+`deregister_session` share one teardown that differs only in a `MasterDisposition`
+([manager.rs:1324](../../crates/remote_server/src/manager.rs#L1324)). `TerminalView` owns the
+recorded sessions and the release, reached from `on_view_detached` for a closed pane and from the
+`ModelEvent::Exit` arm for a shell that dies under a live pane.
+
+Decisions taken during the phase:
+
+- **The sessions are owned by `TerminalView`, not `RemoteServerController`.** The controller is also
+  per-pane and was the first choice, but only one of the two seams could then be tested: nothing in
+  this codebase can drive a `spawn_stream_local` subscription in a unit test, and there is no
+  `run_until_parked`. The view is reachable from both seams — `on_view_detached` already holds
+  `self.view`, and `handle_terminal_event` is directly callable — so one owner serves both and both
+  are pinned.
+- **Sharing the teardown made `deregister_session` idempotent too.** That was not the goal, but the
+  tracked-session guard belongs to both callers, and it is what makes the eighth criterion hold in
+  either ordering.
+
+Scope added during the phase, all from review:
+
+- `app/src/pane_group/mod.rs` and `app/src/workspace/view.rs` — `detach_panes_for_close` detached
+  every pane as `HiddenForClose` even when the tab was being destroyed, so a tab dropped without an
+  undo entry never released. Two acceptance criteria and two declared test paths
+  (`app/src/pane_group/mod_tests.rs`, `app/src/workspace/view_tests.rs`) came in with the fix.
+- A `#[cfg(test)]` recording seam on `TerminalView`, plus two `*_for_test` seeders and a public
+  `tracks_session` on `RemoteServerManager`, because its state is private to its own crate. The
+  seeders are not feature-gated, which is a recorded advisory rather than a fix.
+
+Not covered: closing a *window* was not traced end to end and is recorded in Open Questions. Semantic
+review ran with two of three tracks; the Grok track was unavailable for billing reasons.
+
+### Phase 11: Full test sweep after the last-client fix
+
+**ID:** `11`
+**Goal:** the union of declared tests is green again on the Phase 10 tree
+**Tests:** all
+
+**Acceptance criteria:**
+
+- [ ] The union of test paths declared by completed phases, including Phase 10's, passes.
+- [ ] Failures surfaced by the sweep are remediated in this phase.
+
 ### Phase 8: Outcome
 
 **ID:** `8`
@@ -947,9 +1073,23 @@ exists for.
     (`is_interactive_ssh_session`'s option list accepts them), so a forwarding session gets a
     Warp-owned master. Under `ControlPersist` its listeners survive pane close for the timeout —
     a revocation boundary the design did not weigh.
-  Provisional choice: ship the phase as specified, flag off, and settle this before the flag is
-  enabled anywhere. Options are a last-client force-exit, excluding forwarding invocations from
-  persistence, or accepting a bounded window and documenting it.
+  *Resolved in Phase 10.* Phase 7's review confirmed the first bullet on evidence rather than
+  suspicion: `deregister_session` has exactly one non-failure caller, the remote `ExitShell` hook,
+  so an abruptly closed pane leaves Warp's own proxy attached and the idle timer never starts.
+  Phase 10 releases that client from the local-shell-exit backstop instead, which starts the timer
+  without adding refcount bookkeeping, and bounds the third bullet's port-forwarding window to one
+  idle timeout. The second bullet was already settled in Phase 4 by gating the attach on the source
+  master's reported persistence.
+- **Does closing a window release its panes' SSH sessions?** Raised by review in Phase 10 and left
+  open there. Phase 10 closes the tab paths: a tab dropped without an undo entry now detaches
+  `Closed` and releases. Window close was not traced end to end. The concern is that closing a
+  window may detach its panes reversibly and then discard the window, leaving any undo entries
+  unable to expire — and `clean_up_panes`, the only whole-tab `Closed` sender, runs only on that
+  expiry ([stack.rs:148](../../app/src/undo_close/stack.rs#L148)). If so, a window closed with a
+  warpified SSH pane keeps that master authenticated until Warp exits. This is not a regression —
+  the same path leaked before Phase 10, when nothing released at all — but it is the last known gap
+  in the phase's goal. **Settle before the flag promotes to Stable.**
+
 - **`sshd` `MaxSessions` budget.** Each split consumes an interactive channel plus a
   remote-server-proxy channel, so the default budget of 10 allows fewer splits than it appears.
   Whether to surface a specific message at the limit, or simply fail visibly, is unsettled.

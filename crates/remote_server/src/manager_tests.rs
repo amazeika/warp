@@ -1,11 +1,14 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use futures::channel::oneshot;
 use warp_core::SessionId;
 use warp_util::standardized_path::StandardizedPath;
-use warpui_core::App;
+use warpui_core::{App, ModelHandle};
 
 use super::{
-    HostRequestError, PendingHostRequest, RemoteServerManager, RemoteServerManagerEvent,
-    RipgrepSearchParams,
+    HostRequestError, MasterDisposition, PendingHostRequest, RemoteServerManager,
+    RemoteServerManagerEvent, RemoteSessionState, RipgrepSearchParams,
 };
 use crate::HostId;
 use crate::proto::{ClientMessage, RemoteAgentContextSnapshot, WriteFile, host_scoped_request};
@@ -106,4 +109,126 @@ fn start_ripgrep_search_without_connected_host_resolves_immediately() {
             Err(HostRequestError::AllSessionsDisconnected)
         ));
     });
+}
+
+/// Counts `SessionDeregistered` events for `session_id`.
+fn track_deregistrations(
+    app: &mut App,
+    manager: &ModelHandle<RemoteServerManager>,
+    session_id: SessionId,
+) -> Arc<AtomicUsize> {
+    let count = Arc::new(AtomicUsize::new(0));
+    let count_for_closure = count.clone();
+    app.update(|ctx| {
+        ctx.subscribe_to_model(manager, move |_, event, _| {
+            if matches!(
+                event,
+                RemoteServerManagerEvent::SessionDeregistered { session_id: id } if *id == session_id
+            ) {
+                count_for_closure.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    });
+    count
+}
+
+#[test]
+fn release_session_client_stops_tracking_the_session() {
+    App::test((), |mut app| async move {
+        let manager = app.add_model(RemoteServerManager::new);
+        let session_id = SessionId::from(1);
+
+        manager.update(&mut app, |manager, ctx| {
+            manager
+                .sessions
+                .insert(session_id, RemoteSessionState::Connecting);
+            manager.release_session_client(session_id, ctx);
+
+            assert!(
+                !manager.sessions.contains_key(&session_id),
+                "release should drop the session state, which is what SIGKILLs the proxy child"
+            );
+        });
+    });
+}
+
+#[test]
+fn release_session_client_clears_side_maps_left_behind_by_disconnect() {
+    App::test((), |mut app| async move {
+        let manager = app.add_model(RemoteServerManager::new);
+        let session_id = SessionId::from(1);
+
+        manager.update(&mut app, |manager, ctx| {
+            // `mark_session_disconnected` removes the `sessions` entry on its own and leaves the
+            // side maps behind, so "absent from `sessions`" is not "nothing left to clean".
+            manager
+                .session_labels
+                .insert(session_id, "moira@devbox".to_string());
+            manager.release_session_client(session_id, ctx);
+
+            assert!(
+                !manager.session_labels.contains_key(&session_id),
+                "release should clean the side maps even with no `sessions` entry"
+            );
+        });
+    });
+}
+
+#[test]
+fn release_session_client_is_silent_for_an_untracked_session() {
+    App::test((), |mut app| async move {
+        let manager = app.add_model(RemoteServerManager::new);
+        let session_id = SessionId::from(1);
+        let deregistrations = track_deregistrations(&mut app, &manager, session_id);
+
+        manager.update(&mut app, |manager, ctx| {
+            manager.release_session_client(session_id, ctx);
+        });
+
+        assert_eq!(
+            deregistrations.load(Ordering::Relaxed),
+            0,
+            "a session the manager never tracked must not be announced as deregistered"
+        );
+    });
+}
+
+#[test]
+fn releasing_after_deregister_emits_no_second_deregistered() {
+    App::test((), |mut app| async move {
+        let manager = app.add_model(RemoteServerManager::new);
+        let session_id = SessionId::from(1);
+        let deregistrations = track_deregistrations(&mut app, &manager, session_id);
+
+        manager.update(&mut app, |manager, ctx| {
+            manager
+                .sessions
+                .insert(session_id, RemoteSessionState::Connecting);
+            // The `ExitShell` hook arrives first, then the pane closes.
+            manager.deregister_session(session_id, ctx);
+            manager.release_session_client(session_id, ctx);
+        });
+
+        assert_eq!(
+            deregistrations.load(Ordering::Relaxed),
+            1,
+            "the manager stops tracking a session once, so it announces that once"
+        );
+    });
+}
+
+/// The two teardown callers differ only in what they do with the master, and the force-exit
+/// itself is a detached background task no test can observe — so the rule is pinned here.
+#[test]
+fn only_the_exit_shell_caller_force_exits_the_master() {
+    assert!(
+        MasterDisposition::ForceExitIfWarpOwned.force_exits(),
+        "deregister_session runs after the user's shell exited, and its master is the interactive \
+         ssh that hangs without an explicit -O exit"
+    );
+    assert!(
+        !MasterDisposition::LeaveRunning.force_exits(),
+        "releasing a pane's client must leave the master alone: a persistent one exists so a \
+         split can still be attached to it, and a user-owned one was never ours to stop"
+    );
 }

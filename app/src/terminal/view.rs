@@ -336,6 +336,7 @@ use crate::env_vars::{CloudEnvVarCollection, EnvVar, EnvVarExt};
 use crate::features::FeatureFlag;
 use crate::menu::{Event as MenuEvent, Menu, MenuItem, MenuItemFields};
 use crate::pane_group::focus_state::PaneFocusHandle;
+use crate::pane_group::pane::DetachType;
 use crate::pane_group::{
     CodeReviewPanelArg, PaneConfiguration, PaneEvent, PaneGroupAction, PaneHeaderAction,
     SplitPaneState, TerminalViewResources,
@@ -450,7 +451,8 @@ use crate::terminal::model::mouse::MouseState;
 use crate::terminal::model::selection::{SelectAction, SelectionDirection};
 use crate::terminal::model::session::active_session::ActiveSession;
 use crate::terminal::model::session::{
-    BootstrapSessionType, Session, SessionId, SessionType, Sessions, SessionsEvent, shell_quote_arg,
+    BootstrapSessionType, IsSSHWrapperSession, Session, SessionId, SessionInfo, SessionType,
+    Sessions, SessionsEvent, shell_quote_arg,
 };
 use crate::terminal::model::terminal_model::{
     BlockIndex, BlockSelectionCardinality, SelectedBlocks, TerminalInputState, WithinModel,
@@ -2761,6 +2763,15 @@ pub struct TerminalView {
     /// reported no directory — only this says an attach is outstanding. Shares that field's
     /// lifetime exactly: the one attach attempt the split was made for.
     awaiting_ssh_clone: bool,
+    /// Every SSH wrapper session this pane has started, recorded so the pane can release the
+    /// remote-server clients holding their `ControlMaster`s open when it goes away.
+    ///
+    /// Recorded when a session *starts*, not when its `ssh` command binds at bootstrap success:
+    /// the manager begins tracking a session — and will own a `remote-server-proxy` child for it —
+    /// before the handshake completes, so a pane closed mid-connect must still be able to name it.
+    /// That is also why this is separate from `WarpifyTriggerState`'s single bound session, which
+    /// exists to answer a different question and holds only the innermost one.
+    ssh_wrapper_sessions: HashSet<SessionId>,
     env_vars: Vec<EnvVar>,
 
     show_snackbar: bool,
@@ -4434,6 +4445,7 @@ impl TerminalView {
             pending_auto_bootstrap_shell_type: None,
             pending_remote_cwd: None,
             awaiting_ssh_clone: false,
+            ssh_wrapper_sessions: HashSet::new(),
             pending_env_var_collection: None,
             env_vars: Vec::new(),
             show_snackbar: true,
@@ -11937,6 +11949,11 @@ impl TerminalView {
                 // remote shell never delivers it. The local shell exiting is the backstop: by
                 // then no session of this pane can still be attached.
                 self.warpify_state.release_bound_ssh_command();
+                // The local shell is gone, so nothing of this pane's is attached any more. Release
+                // the remote-server clients rather than wait for a remote `ExitShell` that an
+                // abruptly killed shell never sends. A closed pane does not reach here — see
+                // `release_ssh_wrapper_sessions`.
+                self.release_ssh_wrapper_sessions(ctx);
                 // Nothing in this pane will bootstrap now, and the shell that would have run the
                 // `cd` is gone. This is neither a clone nor a fallback, so it gets its own
                 // outcome: reporting it keeps `Requested` resolving into exactly one terminal
@@ -13094,8 +13111,13 @@ impl TerminalView {
                 #[cfg(target_family = "wasm")]
                 let _ = session_id;
             }
-            // Handled by RemoteServerController via model subscription.
-            ModelEvent::SshInitShell { .. } => {}
+            // The setup flow itself is handled by RemoteServerController via model subscription;
+            // this pane only records that the session exists, so it can release it later.
+            ModelEvent::SshInitShell {
+                pending_session_info,
+            } => {
+                self.record_ssh_wrapper_session(pending_session_info);
+            }
             ModelEvent::RemoteServerBlockRequested { session_id } => {
                 self.show_ssh_remote_server_choice_block(*session_id, ctx);
             }
@@ -13104,6 +13126,43 @@ impl TerminalView {
 
     /// Creates the [`SshRemoteServerChoiceView`] and inserts it as a
     /// rich content block pinned to the bottom of the block list.
+    /// Records `info`'s session as one this pane started, when it is a wrapper session.
+    fn record_ssh_wrapper_session(&mut self, info: &SessionInfo) {
+        if matches!(info.is_ssh_wrapper_session, IsSSHWrapperSession::Yes { .. }) {
+            self.ssh_wrapper_sessions.insert(info.session_id);
+        }
+    }
+
+    /// Records `session_id` as a session this pane started, for tests in sibling modules that
+    /// need a pane holding one. The production recording path is `record_ssh_wrapper_session`,
+    /// covered by this module's own tests.
+    #[cfg(test)]
+    pub(crate) fn record_ssh_wrapper_session_for_test(&mut self, session_id: SessionId) {
+        self.ssh_wrapper_sessions.insert(session_id);
+    }
+
+    /// Releases every SSH session this pane started, so no `remote-server-proxy` child outlives
+    /// the pane and keeps its `ControlMaster` from ever going idle.
+    ///
+    /// The master itself is left alone: a persistent one exists precisely so a split pane can
+    /// still be attached to it, and it expires on its own once this was the last client.
+    ///
+    /// Called from two places, because neither covers the other. `ModelEvent::Exit` is the
+    /// shell-died-while-the-pane-lives case; it is not delivered on an ordinary close, where the
+    /// event loop pushes `Exit` without a wakeup and its consumer is a task owned by the pane
+    /// graph already being dropped. The close case comes through `on_view_detached` instead.
+    pub fn release_ssh_wrapper_sessions(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.ssh_wrapper_sessions.is_empty() {
+            return;
+        }
+        let sessions: Vec<SessionId> = self.ssh_wrapper_sessions.drain().collect();
+        RemoteServerManager::handle(ctx).update(ctx, |mgr, ctx| {
+            for session_id in sessions {
+                mgr.release_session_client(session_id, ctx);
+            }
+        });
+    }
+
     fn show_ssh_remote_server_choice_block(
         &mut self,
         session_id: SessionId,
@@ -29144,6 +29203,15 @@ impl MenuPositioningProvider for TerminalViewMenuPositioningProvider {
         } else {
             MenuPositioning::BelowInputBox
         }
+    }
+}
+
+/// Whether a detach means the pane is gone for good, and so should release the SSH sessions it
+/// started. A reversible detach keeps them: the pane is coming back to the same connection.
+pub fn detach_releases_ssh_sessions(detach_type: DetachType) -> bool {
+    match detach_type {
+        DetachType::Closed => true,
+        DetachType::HiddenForClose | DetachType::Moved => false,
     }
 }
 

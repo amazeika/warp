@@ -297,7 +297,7 @@ use crate::notification::NotificationContext;
 use crate::palette::PaletteMode;
 #[cfg(feature = "local_fs")]
 use crate::pane_group::FilePane;
-use crate::pane_group::pane::ActionOrigin;
+use crate::pane_group::pane::{ActionOrigin, DetachType};
 use crate::pane_group::{
     self, AIFactPane, AnyPaneContent, ChildAgentOrigin, CodeDiffPane, CodePane, CodeReviewPanelArg,
     CustomRouterEditorPane, Direction as PaneGroupDirection, Direction, EnvironmentManagementPane,
@@ -12122,7 +12122,17 @@ impl Workspace {
                     ctx,
                 );
 
-                pane_group.detach_panes_for_close(&working_directories_model, ctx);
+                // A tab that is not stored on the undo stack can never be restored, and nothing
+                // later walks its panes: `clean_up_panes` — the only other source of a `Closed`
+                // detach for a whole tab — runs solely when an undo entry expires. So this is the
+                // last chance to release per-pane resources that outlive the view, such as an SSH
+                // session's remote-server client holding its ControlMaster open.
+                let detach_type = if add_to_undo_stack {
+                    DetachType::HiddenForClose
+                } else {
+                    DetachType::Closed
+                };
+                pane_group.detach_panes_for_close(detach_type, &working_directories_model, ctx);
             });
         }
 
@@ -28240,7 +28250,7 @@ impl Workspace {
 
         let working_directories_model = self.working_directories_model.clone();
         placeholder_pane_group.update(ctx, |pg, ctx| {
-            pg.detach_panes_for_close(&working_directories_model, ctx);
+            pg.detach_panes_for_close(DetachType::HiddenForClose, &working_directories_model, ctx);
         });
         self.pending_pane_group_transfer = false;
         ctx.dispatch_global_action("workspace:save_app", ());
