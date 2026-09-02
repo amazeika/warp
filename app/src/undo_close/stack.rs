@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use uuid::Uuid;
 use warp_errors::report_error;
 use warpui::r#async::SpawnedFutureHandle;
@@ -11,9 +13,11 @@ use super::settings::UndoCloseSettingsChangedEvent;
 use crate::ai::active_agent_views_model::ActiveAgentViewsModel;
 use crate::ai::blocklist::BlocklistAIHistoryModel;
 use crate::pane_group::{PaneGroup, PaneId};
+use crate::remote_server::manager::RemoteServerManager;
 use crate::send_telemetry_from_app_ctx;
 use crate::server::telemetry::{TelemetryEvent, UndoCloseItemType};
 use crate::tab::TabData;
+use crate::terminal::model::session::SessionId;
 use crate::workspace::Workspace;
 
 /// A unique identifier for an item in the undo close stack.
@@ -56,7 +60,14 @@ pub(super) struct PaneData {
 
 /// An item in the undo close stack which can be re-opened.
 pub enum ClosedItem {
-    Window(Box<ClosedWindowData>),
+    Window {
+        data: Box<ClosedWindowData>,
+        /// The SSH wrapper sessions this window's panes started, captured by
+        /// `Workspace::on_window_closed` while the window was still live. Released only if the
+        /// window turns out to be unrestorable; dropped untouched on a successful undo, whose
+        /// restored panes stay armed to release themselves.
+        ssh_sessions: Vec<SessionId>,
+    },
     Tab {
         workspace: WeakViewHandle<Workspace>,
         tab_index: usize,
@@ -72,7 +83,12 @@ impl ClosedItem {
         let history_model = BlocklistAIHistoryModel::handle(ctx);
 
         match self {
-            ClosedItem::Window(data) => {
+            ClosedItem::Window { data, ssh_sessions } => {
+                // This window is gone for good, and its panes were never reachable from here to
+                // release themselves: `clean_up_pane_group` below early-returns on a closed
+                // window, and the window discard has always been a no-op for that reason.
+                release_ssh_sessions(ssh_sessions, ctx);
+
                 let ClosedWindowData { window_id, .. } = *data;
                 ActiveAgentViewsModel::handle(ctx).update(ctx, |model, ctx| {
                     model.remove_focused_state_for_window(window_id, ctx);
@@ -157,6 +173,27 @@ pub enum UndoCloseStackEvent {
 /// A stack of closed items which can be re-opened in LIFO order.
 pub struct UndoCloseStack {
     stack: Vec<UndoData>,
+    /// Sessions captured by `Workspace::on_window_closed` while each window was still live,
+    /// waiting for the `handle_window_closed` that names the same window.
+    staged_window_ssh_sessions: HashMap<WindowId, Vec<SessionId>>,
+}
+
+/// Releases Warp's own multiplexed client for each session, so no `remote-server-proxy` child
+/// outlives the panes that started them.
+///
+/// The `ControlMaster` itself is left alone deliberately — a persistent one exists so a split can
+/// still attach to it, and a user-owned one was never Warp's to stop; both are reaped by the idle
+/// timeout once this was the last client. Releasing a session the manager no longer tracks is a
+/// silent no-op, which is what makes a second release harmless.
+fn release_ssh_sessions(ssh_sessions: Vec<SessionId>, ctx: &mut AppContext) {
+    if ssh_sessions.is_empty() {
+        return;
+    }
+    RemoteServerManager::handle(ctx).update(ctx, |manager, ctx| {
+        for session_id in ssh_sessions {
+            manager.release_session_client(session_id, ctx);
+        }
+    });
 }
 
 impl UndoCloseStack {
@@ -168,6 +205,7 @@ impl UndoCloseStack {
 
         Self {
             stack: Default::default(),
+            staged_window_ssh_sessions: Default::default(),
         }
     }
 
@@ -208,7 +246,86 @@ impl UndoCloseStack {
     /// Handles a window being closed, adding the necessary data to the undo
     /// stack.
     pub fn handle_window_closed(&mut self, data: ClosedWindowData, ctx: &mut ModelContext<Self>) {
-        self.push_item(ClosedItem::Window(Box::new(data)), ctx);
+        let ssh_sessions = self
+            .staged_window_ssh_sessions
+            .remove(&data.window_id)
+            .unwrap_or_default();
+        self.push_item(
+            ClosedItem::Window {
+                data: Box::new(data),
+                ssh_sessions,
+            },
+            ctx,
+        );
+    }
+
+    /// The pane groups of tabs closed from `workspace_id` that are still on this stack.
+    ///
+    /// A closing window needs these because `close_tab` removes a tab from `Workspace::tabs`
+    /// before handing it here, so `tab_views()` no longer lists it while its panes — detached
+    /// `HiddenForClose` — still hold their sessions. Once the window is gone those panes are
+    /// unreachable from anywhere: the tab entry's own discard runs `clean_up_pane_group`, which
+    /// early-returns on a closed window.
+    pub fn stacked_tab_pane_groups(&self, workspace_id: EntityId) -> Vec<ViewHandle<PaneGroup>> {
+        self.stack
+            .iter()
+            .filter_map(|item| match &item.closed_item {
+                ClosedItem::Tab {
+                    workspace, data, ..
+                } if workspace.id() == workspace_id => Some(data.pane_group.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Releases the sessions staged for `window_id` and forgets them, for a caller that reused the
+    /// window-close path without closing a window.
+    ///
+    /// `Workspace::on_log_out` is the only such caller. Its panes are destroyed immediately
+    /// afterwards and never see a `Closed` detach, so releasing here is both correct and the only
+    /// thing that ever will; leaving the entry staged would orphan it under a window that is still
+    /// open, where a later real close would merge it into that window's own sessions.
+    pub fn release_staged_window_ssh_sessions(
+        &mut self,
+        window_id: WindowId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let ssh_sessions = self
+            .staged_window_ssh_sessions
+            .remove(&window_id)
+            .unwrap_or_default();
+        release_ssh_sessions(ssh_sessions, ctx);
+    }
+
+    /// The sessions staged for `window_id`, for tests that need to observe a capture on its own,
+    /// without a close or a discard following it.
+    #[cfg(test)]
+    pub(crate) fn staged_window_ssh_sessions_for_test(
+        &self,
+        window_id: WindowId,
+    ) -> Vec<SessionId> {
+        self.staged_window_ssh_sessions
+            .get(&window_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Records the SSH wrapper sessions of a window that is closing, for the
+    /// `handle_window_closed` that names the same window.
+    ///
+    /// Extends rather than replaces, so several stagers for one window merge. An entry is
+    /// orphaned when no close follows — application termination, where `on_window_will_close`
+    /// returns early, and `Workspace::on_log_out`, which reuses this path without closing a
+    /// window. Both are bounded: an orphan is one `Vec<SessionId>` held until the window really
+    /// closes or the process exits.
+    pub fn stage_window_ssh_sessions(&mut self, window_id: WindowId, ssh_sessions: Vec<SessionId>) {
+        if ssh_sessions.is_empty() {
+            return;
+        }
+        self.staged_window_ssh_sessions
+            .entry(window_id)
+            .or_default()
+            .extend(ssh_sessions);
     }
 
     /// Handles a tab being closed, adding the necessary data to the undo
@@ -252,7 +369,7 @@ impl UndoCloseStack {
         };
 
         match closed_item {
-            ClosedItem::Window(data) => {
+            ClosedItem::Window { data, ssh_sessions } => {
                 send_telemetry_from_app_ctx!(
                     TelemetryEvent::UndoClose {
                         item_type: UndoCloseItemType::Window,
@@ -263,10 +380,22 @@ impl UndoCloseStack {
                 let window_id = data.window_id;
                 ctx.reopen_closed_window(*data);
 
-                if let Some(workspace) = window_workspace(window_id, ctx) {
-                    workspace.update(ctx, |workspace, ctx| {
-                        workspace.handle_reopen(ctx);
-                    });
+                // A restore counts only if it produced both a platform window and a live
+                // workspace, because neither implies the other and either shape alone leaves
+                // these panes unreachable. `reopen_closed_window` returns before touching any
+                // state when the cached bounds are absent, leaving no workspace; and it
+                // reinstates the cached window and views before it inspects whether the platform
+                // window actually opened, so a platform failure leaves a resolvable workspace
+                // behind a window that does not exist. Anything short of both means the window is
+                // gone for good with nothing left to release these itself.
+                let has_platform_window = ctx.windows().platform_window(window_id).is_some();
+                match window_workspace(window_id, ctx) {
+                    Some(workspace) if has_platform_window => {
+                        workspace.update(ctx, |workspace, ctx| {
+                            workspace.handle_reopen(ctx);
+                        });
+                    }
+                    _ => release_ssh_sessions(ssh_sessions, ctx),
                 }
 
                 // Make sure we update our session restoration state now that the
@@ -400,3 +529,7 @@ impl Entity for UndoCloseStack {
 }
 
 impl SingletonEntity for UndoCloseStack {}
+
+#[cfg(test)]
+#[path = "stack_tests.rs"]
+mod tests;

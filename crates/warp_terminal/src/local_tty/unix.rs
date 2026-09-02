@@ -237,6 +237,7 @@ pub(super) fn spawn(options: PtyOptions) -> Result<PtySpawnInfo> {
         env_vars,
         enable_ssh_wrapper,
         reuse_ssh_control_master,
+        clone_ssh_on_split,
         shell_debug_mode,
         honor_ps1,
         node_version_chip_enabled,
@@ -258,6 +259,7 @@ pub(super) fn spawn(options: PtyOptions) -> Result<PtySpawnInfo> {
         start_dir,
         enable_ssh_wrapper,
         reuse_ssh_control_master,
+        clone_ssh_on_split,
         shell_debug_mode,
         honor_ps1,
         node_version_chip_enabled,
@@ -279,6 +281,7 @@ fn build_host_shell_command(
     start_dir: Option<PathBuf>,
     enable_ssh_wrapper: bool,
     reuse_ssh_control_master: bool,
+    clone_ssh_on_split: bool,
     shell_debug_mode: bool,
     honor_ps1: bool,
     node_version_chip_enabled: bool,
@@ -372,15 +375,11 @@ fn build_host_shell_command(
 
     // Whether a Warp-owned ControlMaster should outlive the foreground `ssh`
     // that created it. Only meaningful with the feature on: it changes the
-    // lifetime of every Warp SSH connection, so with the flag off the wrapper
+    // lifetime of every Warp SSH connection, so with the feature off the wrapper
     // must emit exactly what it emitted before this feature existed.
     builder.env(
         "WARP_SSH_CONTROL_PERSIST",
-        if FeatureFlag::CloneSshOnSplit.is_enabled() {
-            "1"
-        } else {
-            "0"
-        },
+        if clone_ssh_on_split { "1" } else { "0" },
     );
 
     // For integration tests, put SSH control master sockets under the actual
@@ -802,6 +801,7 @@ fn spawn_docker_sandbox(
         env_vars,
         enable_ssh_wrapper,
         reuse_ssh_control_master,
+        clone_ssh_on_split,
         shell_debug_mode,
         honor_ps1,
         node_version_chip_enabled,
@@ -814,6 +814,7 @@ fn spawn_docker_sandbox(
         env_vars,
         enable_ssh_wrapper,
         reuse_ssh_control_master,
+        clone_ssh_on_split,
         shell_debug_mode,
         honor_ps1,
         node_version_chip_enabled,
@@ -835,6 +836,7 @@ fn build_docker_sandbox_command(
     env_vars: HashMap<OsString, OsString>,
     enable_ssh_wrapper: bool,
     reuse_ssh_control_master: bool,
+    clone_ssh_on_split: bool,
     shell_debug_mode: bool,
     honor_ps1: bool,
     node_version_chip_enabled: bool,
@@ -902,11 +904,7 @@ fn build_docker_sandbox_command(
     );
     builder.env(
         "WARP_SSH_CONTROL_PERSIST",
-        if FeatureFlag::CloneSshOnSplit.is_enabled() {
-            "1"
-        } else {
-            "0"
-        },
+        if clone_ssh_on_split { "1" } else { "0" },
     );
     builder.env("SSH_SOCKET_DIR", ssh_socket_dir());
     builder.env("WARP_IS_LOCAL_SHELL_SESSION", "1");

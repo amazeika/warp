@@ -13133,6 +13133,19 @@ impl TerminalView {
         }
     }
 
+    /// The SSH wrapper sessions this pane started, as a copy.
+    ///
+    /// A snapshot and deliberately not a drain. The pane may be coming back: undoing a window
+    /// close reopens the window and reattaches its panes, and nothing re-arms a pane's set —
+    /// `record_ssh_wrapper_session` runs only from the `SshInitShell` arm, at session start. A
+    /// drained pane would be disarmed for the rest of its life, so its own later close would
+    /// release nothing. Releasing the same session twice is harmless instead:
+    /// `release_session_client` returns without emitting for a session the manager no longer
+    /// tracks.
+    pub fn ssh_wrapper_session_snapshot(&self) -> Vec<SessionId> {
+        self.ssh_wrapper_sessions.iter().copied().collect()
+    }
+
     /// Records `session_id` as a session this pane started, for tests in sibling modules that
     /// need a pane holding one. The production recording path is `record_ssh_wrapper_session`,
     /// covered by this module's own tests.

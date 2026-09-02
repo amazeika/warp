@@ -9,6 +9,11 @@
 
 use std::path::PathBuf;
 
+use settings::Setting as _;
+use warpui::{AppContext, SingletonEntity as _};
+
+use crate::features::FeatureFlag;
+use crate::settings::SshSettings;
 use crate::terminal::model::session::{IsSSHWrapperSession, SessionType};
 use crate::terminal::ssh::util::submittable_remote_cwd;
 
@@ -126,6 +131,33 @@ impl CloneGate {
     pub fn is_open(self) -> bool {
         self.feature_flag && self.ssh_warpification && self.setting
     }
+}
+
+/// Whether a pane spawned now should keep its Warp-owned `ControlMaster` alive past the
+/// foreground `ssh` that created it — that is, the value of `WARP_SSH_CONTROL_PERSIST`.
+///
+/// Both conjuncts are required, and for different reasons. The flag alone would make a user who
+/// declined the feature pay for masters that outlive their `ssh`; the setting alone would turn the
+/// lifetime change on in a build where the feature is meant to be inert.
+///
+/// Deliberately narrower than [`CloneGate`], which also requires SSH warpification. That conjunct
+/// is what decides whether a *split* may attach; here it would be redundant, since a pane spawned
+/// with warpification off carries `WARP_USE_SSH_WRAPPER=0` and never reaches the helper that reads
+/// this variable at all.
+pub fn control_persist_enabled(feature_flag: bool, setting: bool) -> bool {
+    feature_flag && setting
+}
+
+/// Reads both conjuncts of [`control_persist_enabled`] from their real sources.
+///
+/// Split out for the same reason as `PaneGroup::ssh_clone_gate`: the rule alone proves nothing
+/// about the wiring, and a literal left in place of either read would satisfy the rule while
+/// ignoring the flag or the user.
+pub fn clone_ssh_on_split_enabled(ctx: &AppContext) -> bool {
+    control_persist_enabled(
+        FeatureFlag::CloneSshOnSplit.is_enabled(),
+        *SshSettings::as_ref(ctx).clone_ssh_on_split.value(),
+    )
 }
 
 /// The clone request for a split of `source`, or the reason to fall back to an ordinary local

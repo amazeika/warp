@@ -7979,6 +7979,20 @@ impl PaneGroup {
         };
     }
 
+    /// The SSH wrapper sessions started by every terminal pane in this group, as a copy.
+    ///
+    /// For a caller that still has the views and will decide later whether the close is
+    /// permanent. See [`TerminalView::ssh_wrapper_session_snapshot`] for why this must not drain.
+    pub fn snapshot_ssh_wrapper_sessions(
+        &self,
+        ctx: &AppContext,
+    ) -> Vec<crate::terminal::model::session::SessionId> {
+        self.terminal_pane_ids()
+            .filter_map(|pane_id| self.terminal_view_from_pane_id(pane_id, ctx))
+            .flat_map(|terminal_view| terminal_view.as_ref(ctx).ssh_wrapper_session_snapshot())
+            .collect()
+    }
+
     /// Detach all panes from this group. This is called when a tab is closed, but may still
     /// be restored.
     pub fn detach_panes(&self, ctx: &mut ViewContext<Self>) {

@@ -110,9 +110,7 @@ pub(super) fn get_shell_environment_variables(options: &PtyOptions) -> Vec<u16> 
         map_key(SSH_CONTROL_PERSIST_NAME.into()),
         EnvEntry {
             preferred_key: SSH_CONTROL_PERSIST_NAME.into(),
-            value: (FeatureFlag::CloneSshOnSplit.is_enabled() as usize)
-                .to_string()
-                .into(),
+            value: (options.clone_ssh_on_split as usize).to_string().into(),
         },
     );
     env.insert(

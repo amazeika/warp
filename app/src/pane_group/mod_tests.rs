@@ -4142,3 +4142,48 @@ mod ssh_session_release_on_detach {
         );
     }
 }
+
+/// `WARP_SSH_CONTROL_PERSIST` is decided at pane spawn from the same flag and setting, through
+/// `clone_ssh_on_split_enabled`. The rule itself is pinned in `clone_on_split_tests`; this pins the
+/// wiring, so a literal left in place of either read cannot pass.
+#[test]
+fn test_control_persist_reads_the_flag_and_the_setting_from_their_real_sources() {
+    use crate::terminal::ssh::clone_on_split::clone_ssh_on_split_enabled;
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let _flag = FeatureFlag::CloneSshOnSplit.override_enabled(true);
+        SshSettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.clone_ssh_on_split.set_value(true, ctx).unwrap();
+        });
+        app.read(|ctx| {
+            assert!(
+                clone_ssh_on_split_enabled(ctx),
+                "flag and setting both on must enable ControlPersist at spawn"
+            );
+        });
+
+        SshSettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.clone_ssh_on_split.set_value(false, ctx).unwrap();
+        });
+        app.read(|ctx| {
+            assert!(
+                !clone_ssh_on_split_enabled(ctx),
+                "the opt-in must come from the user's setting, not the flag alone"
+            );
+        });
+
+        SshSettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.clone_ssh_on_split.set_value(true, ctx).unwrap();
+        });
+        drop(_flag);
+        let _flag_off = FeatureFlag::CloneSshOnSplit.override_enabled(false);
+        app.read(|ctx| {
+            assert!(
+                !clone_ssh_on_split_enabled(ctx),
+                "the setting alone must not enable it in a build where the flag is off"
+            );
+        });
+    })
+}

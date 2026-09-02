@@ -97,6 +97,17 @@ pub struct PtyOptions {
     /// verified with `ssh -O check`) instead of always creating its own.
     #[serde(default)]
     pub reuse_ssh_control_master: bool,
+    /// Whether a Warp-owned `ControlMaster` should outlive the foreground `ssh`
+    /// that created it, so a pane split out of that session can still attach.
+    ///
+    /// True only when the `CloneSshOnSplit` flag and the `clone_ssh_on_split`
+    /// setting are both on. Both the unix and Windows spawn paths derive
+    /// `WARP_SSH_CONTROL_PERSIST` from this one field, so the two cannot drift
+    /// apart. With it false the wrapper behaves exactly as it did before this
+    /// feature existed: the variable is pinned to `0`, which the wrapper treats
+    /// the same as unset, since its only read compares against `1`.
+    #[serde(default)]
+    pub clone_ssh_on_split: bool,
     pub shell_debug_mode: bool,
     pub honor_ps1: bool,
     /// Whether the Node.js Version context chip is enabled for this session. When

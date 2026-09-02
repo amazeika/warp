@@ -3,7 +3,7 @@ status: in-progress
 issue: 5409
 tracking: amazeika/warp#1
 pr: null
-completed: [1, 2, 3, 4, 5, 6, 7, 10, 11]
+completed: [1, 2, 3, 4, 5, 6, 7, 10, 11, 12]
 ---
 
 # Reuse the SSH connection when splitting a pane — Design Document
@@ -975,9 +975,7 @@ review ran with two of three tracks; the Grok track was unavailable for billing 
 **ID:** `12`
 **Goal:** a Warp-owned master stops outliving its visible use in the two cases Phase 10 left — the
 panes of a closed window, and a user who declined the feature entirely
-**Tests:** `app/src/workspace/view_tests.rs`, `app/src/undo_close/stack_tests.rs`,
-`app/src/terminal/view_tests.rs`, `crates/warp_terminal/src/local_tty/unix_tests.rs`,
-`crates/warp_terminal/src/local_tty/windows/environment_tests.rs`
+**Tests:** `app/src/workspace/view_tests.rs`, `app/src/undo_close/stack_tests.rs`, `app/src/terminal/view_tests.rs`, `app/src/terminal/ssh/clone_on_split_tests.rs`, `app/src/pane_group/mod_tests.rs`, `crates/warp_terminal/src/local_tty/unix_tests.rs`
 
 This phase carries two changes that share a rationale — a master outliving the use that justified
 it — but not a mechanism. One is a view-lifecycle contract spanning `workspace`, `undo_close`, and
@@ -987,29 +985,85 @@ the plumbing with it.
 
 **Acceptance criteria — closed windows:**
 
-- [ ] Closing a window releases the remote-server clients of every warpified SSH session its panes
-      started, once that window can no longer be restored.
-- [ ] Undoing a window close releases nothing: the restored panes keep their connections and remain
+- [x] Closing a window releases the remote-server clients of every warpified SSH session its panes
+      started, once that window can no longer be restored. Includes the panes of tabs already
+      waiting on the undo stack, which left `Workspace::tabs` when they were closed.
+- [x] Undoing a window close releases nothing: the restored panes keep their connections and remain
       usable.
-- [ ] The release happens both when undo-close is enabled, where the window's entry discards on
+- [x] The release happens both when undo-close is enabled, where the window's entry discards on
       expiry, and when it is disabled, where `push_item` discards immediately.
-- [ ] The release is driven from state captured while the window is still live, since after
+- [x] The release is driven from state captured while the window is still live, since after
       `handle_window_closed` the window is absent from `AppContext::windows` and its views are
       unreachable through `views_of_type` and `is_window_open`.
-- [ ] Releasing twice is harmless: a pane whose tab already released under Phase 10, in a window
+- [x] Releasing twice is harmless: a pane whose tab already released under Phase 10, in a window
       that then closes, releases once and reports no error.
-- [ ] A window closing during application termination is left alone — `on_window_will_close` already
+- [x] A window closing during application termination is left alone — `on_window_will_close` already
       returns early there, and process exit drops the proxies — and this phase adds no error on
-      that path.
+      that path. *Met by construction, not by test:* the early return is in `app/src/lib.rs`, reached
+      only from the platform close callback, which no test wires. This phase adds no code to that
+      path.
 
 **Acceptance criteria — `ControlPersist` and the setting:**
 
-- [ ] `WARP_SSH_CONTROL_PERSIST` is `1` only when the `CloneSshOnSplit` flag and the
+- [x] `WARP_SSH_CONTROL_PERSIST` is `1` only when the `CloneSshOnSplit` flag and the
       `clone_ssh_on_split` setting are both on, and `0` otherwise.
-- [ ] With the setting off, the wrapper environment is byte-identical to what it was before this
-      feature existed.
-- [ ] The unix and Windows spawn paths derive the value from the same `PtyOptions` field, so they
+- [x] With the setting off, the wrapper behaves exactly as it did before this feature existed:
+      `WARP_SSH_CONTROL_PERSIST` is pinned to `0`, which the wrapper's only read — a comparison
+      against `1` — treats the same as unset. Not byte-identical: the variable did not exist at
+      all before this branch, and it is deliberately always set, so a value inherited from Warp's
+      own environment cannot turn persist mode on.
+- [x] The unix and Windows spawn paths derive the value from the same `PtyOptions` field, so they
       cannot drift apart.
+
+The Windows spawn path is changed but not tested here. `local_tty::windows` is `#[cfg(windows)]`
+([local_tty/mod.rs:18](../../crates/warp_terminal/src/local_tty/mod.rs#L18)), so
+`windows/environment_tests.rs` cannot compile or run in this checkout; it was dropped from this
+phase's declared tests rather than declared as a gate that would never go green. Windows is not
+tested in this checkout at all. The drift criterion is therefore carried by the single `PtyOptions`
+field, which makes the two paths' agreement a property of the type rather than of a convention, plus
+the unix test that pins the field's effect on the emitted environment.
+
+**Delivered.** Two decisions were settled by `/ckit:doubt` before implementation, and two more were
+forced by review; all four changed the design rather than merely confirming it.
+
+- **The capture is a snapshot, never a drain.** Draining each pane's `ssh_wrapper_sessions` is lossy
+  across close → undo → close: the restored panes come back live but unarmed, and nothing re-arms
+  them, since `record_ssh_wrapper_session` runs only when a session starts. Their eventual real
+  close would then release nothing — the exact leak Phase 10 exists to prevent. Releasing the same
+  session twice is harmless instead, so a copy costs nothing.
+- **A failed restore must release.** `undo_close` pops the entry and consumes the `ClosedWindowData`
+  before the restore can fail, so a failure leaves the window permanently gone with nothing
+  released. Two independent failure shapes exist and neither implies the other: `reopen_closed_window`
+  returns at its missing-bounds guard without touching any state, leaving no workspace; and
+  `insert_window_internal` reinstates the cached window and views *before* it inspects whether the
+  platform window opened, leaving a resolvable workspace behind a window that does not exist. The
+  predicate is therefore both halves — a live platform window **and** a resolvable workspace. Doing
+  this from the app layer needs no `warpui_core` signature change, because
+  `ctx.windows().platform_window(..)` is already public and already used in that shape.
+- **Tabs on the undo stack are the window's panes too.** *Found in review.* `close_tab` removes a tab
+  from `Workspace::tabs` before handing it to the stack, so the live-tab walk cannot see it while its
+  panes remain alive holding sessions. Once the window is gone nothing can reach them: the tab
+  entry's own discard early-returns on a closed window. The capture now also walks the stack's tab
+  entries for this workspace.
+- **Logout must release what it stages.** *Found in review.* `Workspace::on_log_out` reuses
+  `on_window_closed` without closing a window, so nothing would ever deliver the `ClosedWindowData`
+  that drains the staged entry; a later real close of the same window would merge those ids in, and a
+  successful undo would drop them unreleased. Logout now drains and releases its own entry, which
+  also closes a leak that predates this phase — those panes are destroyed immediately afterwards
+  without a `Closed` detach, so nothing else ever would.
+
+**Deviations.**
+
+- `AppContext::close_window_for_test` was added to `warpui_core` behind the existing
+  `#[cfg(any(test, feature = "test-util"))]` convention. The test platform's `close_window_async` is
+  a no-op, so without it no test in the repository can close a window at all and every closed-window
+  criterion would have been untestable. It wraps the production `handle_window_closed` rather than
+  simulating it.
+- The flag-and-setting rule and its reads live in `terminal/ssh/clone_on_split.rs`
+  (`control_persist_enabled`, `clone_ssh_on_split_enabled`) rather than inline at the spawn site,
+  which has no test module. This mirrors `PaneGroup::ssh_clone_gate`: the rule alone proves nothing
+  about the wiring, so the reads are split out where a test can pin that each conjunct comes from its
+  real source.
 
 Reverses the Phase 6 decision "the setting deliberately does not reach `WARP_SSH_CONTROL_PERSIST`".
 That decision was right about mechanism — the setting is read at split time and cannot retroactively
@@ -1164,17 +1218,18 @@ exists for.
   open there, because window close had not been traced end to end. *Resolved: it does not. Fixed in
   Phase 12.* The trace found two independent guards, each of which alone is enough to skip the
   release:
-  - `Workspace::on_window_closed` ([view.rs:27872](../../app/src/workspace/view.rs#L27872)) walks
-    every tab's pane group and detaches as `HiddenForClose`
-    ([mod.rs:7987](../../app/src/pane_group/mod.rs#L7987)) — reversible, so nothing is released.
+  - `Workspace::on_window_closed` ([workspace/view.rs](../../app/src/workspace/view.rs)) walks
+    every tab's pane group and detaches through `PaneGroup::detach_panes`
+    ([pane_group/mod.rs](../../app/src/pane_group/mod.rs)) as `HiddenForClose` — reversible, so
+    nothing is released.
     That is correct on its own terms: the window may come back through undo.
-  - The window is then removed outright — `handle_window_closed` does
-    `self.windows.remove(&window_id)` and moves the `Window` into `ClosedWindowData`
-    ([app.rs:4704](../../crates/warpui_core/src/core/app.rs#L4704)). So when the undo entry
-    discards, `ClosedItem::Window::discard` ([stack.rs:75](../../app/src/undo_close/stack.rs#L75))
-    resolves the workspace through `views_of_type`, which indexes `self.windows` and returns
-    `None`. Even if it resolved, `clean_up_pane_group` early-returns on `!ctx.is_window_open`
-    ([stack.rs:143](../../app/src/undo_close/stack.rs#L143)).
+  - The window is then removed outright — `AppContext::handle_window_closed`
+    ([warpui_core/core/app.rs](../../crates/warpui_core/src/core/app.rs)) does
+    `self.windows.remove(&window_id)` and moves the `Window` into `ClosedWindowData`. So when the
+    undo entry discards, `ClosedItem::Window::discard`
+    ([undo_close/stack.rs](../../app/src/undo_close/stack.rs)) resolves the workspace through
+    `views_of_type`, which indexes `self.windows` and returns `None`. Even if it resolved,
+    `clean_up_pane_group` early-returns on `!ctx.is_window_open`.
 
   The panes' views stay alive inside `ClosedWindowData`, and `Drop for TerminalView` only sends
   telemetry — it has no release path. This holds whether undo-close is enabled (discard on expiry)

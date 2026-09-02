@@ -10863,4 +10863,40 @@ mod ssh_wrapper_session_release {
             "a moved pane keeps its connection"
         );
     }
+
+    /// A window close snapshots this set rather than draining it, and that difference is
+    /// load-bearing: an undone close brings these panes back, and nothing re-arms a set that was
+    /// taken away — `record_ssh_wrapper_session` runs only when a session starts. A drained pane
+    /// would be unable to release itself for the rest of its life.
+    #[test]
+    fn snapshotting_leaves_the_pane_able_to_release_later() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+
+            terminal.update(&mut app, |view, ctx| {
+                view.handle_terminal_event(
+                    &ModelEvent::SshInitShell {
+                        pending_session_info: Box::new(wrapper_session_info(7)),
+                    },
+                    ctx,
+                );
+            });
+
+            let first = terminal.read(&app, |view, _ctx| view.ssh_wrapper_session_snapshot());
+            let second = terminal.read(&app, |view, _ctx| view.ssh_wrapper_session_snapshot());
+
+            assert_eq!(first, vec![SessionId::from(7)]);
+            assert_eq!(
+                second, first,
+                "a snapshot must not consume what it reports, or a second caller sees nothing"
+            );
+            assert_eq!(
+                recorded_sessions(&terminal, &app),
+                vec![SessionId::from(7)],
+                "the pane keeps its sessions, so its own later close still releases them"
+            );
+        })
+    }
 }

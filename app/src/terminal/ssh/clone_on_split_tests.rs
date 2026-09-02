@@ -339,3 +339,26 @@ fn ssh_warpification_off_closes_the_gate_over_an_enabled_setting() {
         Err(CloneDeclined::Disabled)
     );
 }
+
+/// `WARP_SSH_CONTROL_PERSIST` changes the lifetime of every Warp SSH connection, so it takes both
+/// the flag and the user's setting. Each case names which conjunct it drops, so a rule that
+/// silently degenerated to one of them fails here rather than at a user's cost.
+#[test]
+fn control_persist_requires_both_the_flag_and_the_setting() {
+    assert!(
+        control_persist_enabled(true, true),
+        "flag and setting both on must enable ControlPersist"
+    );
+    assert!(
+        !control_persist_enabled(true, false),
+        "the flag alone must not enable ControlPersist for a user who declined the setting"
+    );
+    assert!(
+        !control_persist_enabled(false, true),
+        "the setting alone must not enable ControlPersist in a build where the flag is off"
+    );
+    assert!(
+        !control_persist_enabled(false, false),
+        "neither on must leave ControlPersist off"
+    );
+}
