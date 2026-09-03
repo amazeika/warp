@@ -1296,14 +1296,6 @@ struct SessionBootstrapInfo {
     shell_path: Option<String>,
 }
 
-/// Singleton model that manages connections to `remote_server` processes on
-/// remote hosts.
-///
-/// Each SSH session gets its own `RemoteServerClient` and SSH connection.
-/// Deduplication of the underlying long-lived server process happens on the
-/// remote host. The `HostId` returned by the server's `InitializeResponse`
-/// is used on the client to deduplicate host-scoped models (e.g.
-/// `RepoMetadataModel`), not connections.
 /// What teardown should do with the session's SSH `ControlMaster`.
 #[derive(Clone, Copy)]
 enum MasterDisposition {
@@ -1329,6 +1321,14 @@ impl MasterDisposition {
     }
 }
 
+/// Singleton model that manages connections to `remote_server` processes on
+/// remote hosts.
+///
+/// Each SSH session gets its own `RemoteServerClient` and SSH connection.
+/// Deduplication of the underlying long-lived server process happens on the
+/// remote host. The `HostId` returned by the server's `InitializeResponse`
+/// is used on the client to deduplicate host-scoped models (e.g.
+/// `RepoMetadataModel`), not connections.
 pub struct RemoteServerManager {
     /// Per-session connection state. Each SSH session gets its own dedicated
     /// connection to the remote server.

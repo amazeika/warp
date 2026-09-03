@@ -15,6 +15,7 @@ use warpui::{AppContext, SingletonEntity as _};
 use crate::features::FeatureFlag;
 use crate::settings::SshSettings;
 use crate::terminal::model::session::{IsSSHWrapperSession, SessionType};
+use crate::terminal::shell::ShellType;
 
 /// Set on a split pane's local shell to ask the SSH wrapper to attach to an existing
 /// ControlMaster rather than create its own. The wrapper consumes and unsets it on its first
@@ -65,6 +66,9 @@ pub enum CloneDeclined {
     MasterWouldNotOutliveSource,
     /// The socket lives inside a WSL distro the new pane cannot reach.
     WslDistroMismatch,
+    /// The shell the new pane will run defines no `ssh` wrapper, so the replayed command would
+    /// dial the host itself.
+    TargetShellHasNoWrapper,
     /// No `ssh` command is bound to the source session, so there is nothing to replay.
     NoBoundCommand,
 }
@@ -95,6 +99,7 @@ impl CloneDeclined {
             Self::NoWrapperSocket => "no_wrapper_socket",
             Self::MasterWouldNotOutliveSource => "master_would_not_outlive_source",
             Self::WslDistroMismatch => "wsl_distro_mismatch",
+            Self::TargetShellHasNoWrapper => "target_shell_has_no_wrapper",
             Self::NoBoundCommand => "no_bound_command",
         }
     }
@@ -163,6 +168,7 @@ pub fn clone_ssh_on_split_enabled(ctx: &AppContext) -> bool {
 pub fn clone_request(
     source: &SshCloneFacts,
     target_wsl_distro: Option<&str>,
+    target_shell: Option<ShellType>,
     enabled: bool,
 ) -> Result<SshCloneRequest, CloneDeclined> {
     if !enabled {
@@ -199,6 +205,17 @@ pub fn clone_request(
     // The socket lives inside the source session's WSL distro, so no pane outside it can reach it.
     if source.wsl_distro.as_deref() != target_wsl_distro {
         return Err(CloneDeclined::WslDistroMismatch);
+    }
+
+    // `warp_ssh_helper` — the function that reads the attach request — is defined only in the
+    // bash, zsh and fish bootstraps. A pane spawned with any other shell would run the replayed
+    // `ssh` as a plain command, dial the host itself, and prompt for exactly the credentials this
+    // feature exists to avoid. `None` is the pane inheriting the default shell, which carries the
+    // wrapper by construction: the source pane warpified through it.
+    if let Some(shell) = target_shell
+        && !matches!(shell, ShellType::Bash | ShellType::Zsh | ShellType::Fish)
+    {
+        return Err(CloneDeclined::TargetShellHasNoWrapper);
     }
 
     Ok(SshCloneRequest {

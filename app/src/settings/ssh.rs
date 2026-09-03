@@ -23,7 +23,7 @@ define_settings_group!(SshSettings,
             private: false,
             storage_key: "CloneSshOnSplit",
             toml_path: "warpify.ssh.clone_ssh_on_split",
-            description: "Whether splitting a pane that holds a warpified SSH session opens the new pane on that same SSH connection, in the same remote directory, instead of a local shell.",
+            description: "Whether splitting a pane that holds a warpified SSH session opens the new pane on that same SSH connection instead of a local shell.",
         },
     ]
 );

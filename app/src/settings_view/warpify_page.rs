@@ -69,7 +69,7 @@ const ITEM_VERTICAL_SPACING: f32 = 24.;
 const BUILT_IN_TEXT_INPUT_MARGIN: f32 = 10.;
 const SPACE_AFTER_TEXT_INPUT: f32 = ITEM_VERTICAL_SPACING - BUILT_IN_TEXT_INPUT_MARGIN;
 
-const SSH_CLONE_ON_SPLIT_DESCRIPTION: &str = "Split a pane that holds a warpified SSH session and the new pane joins that same connection, in the same remote directory, without authenticating again. Splits of local panes are unaffected.";
+const SSH_CLONE_ON_SPLIT_DESCRIPTION: &str = "Split a pane that holds a warpified SSH session and the new pane joins that same connection, without authenticating again. Splits of local panes are unaffected.";
 const SSH_REUSE_CONTROL_MASTER_DESCRIPTION: &str = "Attach to a live SSH ControlMaster you already have configured for the destination host instead of creating a Warp-owned one. Takes effect in new tabs.";
 
 const SSH_EXTENSION_INSTALL_MODE_DESCRIPTION: &str = "Controls the installation behavior for Warp's SSH extension when a remote host doesn't have it installed.";

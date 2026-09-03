@@ -1,4 +1,4 @@
-//! Releasing a closed window's SSH sessions (GH5409 Phase 12).
+//! Releasing a closed window's SSH sessions.
 //!
 //! A window's panes are unreachable the moment it closes: `ClosedItem::Window::discard` resolves
 //! its workspace through `views_of_type`, which returns `None` once the window is out of

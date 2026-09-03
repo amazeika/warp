@@ -29,8 +29,13 @@ fn source(session_type: SessionType, wrapper: IsSSHWrapperSession) -> SshCloneFa
 
 #[test]
 fn attaches_to_the_source_session_socket() {
-    let request = clone_request(&source(remote(), warp_persistent_master()), None, true)
-        .expect("a persistent Warp master is attachable");
+    let request = clone_request(
+        &source(remote(), warp_persistent_master()),
+        None,
+        None,
+        true,
+    )
+    .expect("a persistent Warp master is attachable");
 
     assert_eq!(request.socket_path, Path::new(SOCKET));
 }
@@ -39,8 +44,13 @@ fn attaches_to_the_source_session_socket() {
 /// `parse_interactive_ssh_command`; replaying anything but the exact string gives that up.
 #[test]
 fn replays_the_bound_command_verbatim() {
-    let request = clone_request(&source(remote(), warp_persistent_master()), None, true)
-        .expect("a persistent Warp master is attachable");
+    let request = clone_request(
+        &source(remote(), warp_persistent_master()),
+        None,
+        None,
+        true,
+    )
+    .expect("a persistent Warp master is attachable");
 
     assert_eq!(request.command, COMMAND);
 }
@@ -55,7 +65,7 @@ fn attaches_to_a_user_owned_master() {
     };
 
     assert!(
-        clone_request(&source(remote(), wrapper), None, true).is_ok(),
+        clone_request(&source(remote(), wrapper), None, None, true).is_ok(),
         "a master Warp does not own survives the source pane, so a split may attach to it"
     );
 }
@@ -71,7 +81,7 @@ fn does_not_attach_to_a_master_that_dies_with_the_source_pane() {
     };
 
     assert_eq!(
-        clone_request(&source(remote(), wrapper), None, true),
+        clone_request(&source(remote(), wrapper), None, None, true),
         Err(CloneDeclined::MasterWouldNotOutliveSource)
     );
 }
@@ -81,7 +91,7 @@ fn does_not_attach_to_a_local_session() {
     let source = source(SessionType::Local, warp_persistent_master());
 
     assert_eq!(
-        clone_request(&source, None, true),
+        clone_request(&source, None, None, true),
         Err(CloneDeclined::NotWarpifiedRemote)
     );
 }
@@ -92,7 +102,7 @@ fn does_not_attach_to_a_session_the_wrapper_did_not_establish() {
     let source = source(remote(), IsSSHWrapperSession::No);
 
     assert_eq!(
-        clone_request(&source, None, true),
+        clone_request(&source, None, None, true),
         Err(CloneDeclined::NoWrapperSocket)
     );
 }
@@ -105,7 +115,7 @@ fn does_not_attach_without_a_bound_command() {
     };
 
     assert_eq!(
-        clone_request(&source, None, true),
+        clone_request(&source, None, None, true),
         Err(CloneDeclined::NoBoundCommand)
     );
 }
@@ -119,7 +129,7 @@ fn does_not_attach_across_wsl_distros() {
     };
 
     assert_eq!(
-        clone_request(&source, Some("Debian"), true),
+        clone_request(&source, Some("Debian"), None, true),
         Err(CloneDeclined::WslDistroMismatch)
     );
 }
@@ -131,7 +141,7 @@ fn attaches_within_one_wsl_distro() {
         ..source(remote(), warp_persistent_master())
     };
 
-    assert!(clone_request(&source, Some("Ubuntu"), true).is_ok());
+    assert!(clone_request(&source, Some("Ubuntu"), None, true).is_ok());
 }
 
 #[test]
@@ -139,7 +149,7 @@ fn does_not_attach_when_the_feature_is_disabled() {
     let source = source(remote(), warp_persistent_master());
 
     assert_eq!(
-        clone_request(&source, None, false),
+        clone_request(&source, None, None, false),
         Err(CloneDeclined::Disabled)
     );
 }
@@ -154,7 +164,7 @@ fn does_not_attach_when_the_source_reports_no_distro_but_the_target_is_wsl() {
     assert_eq!(source.wsl_distro, None);
 
     assert_eq!(
-        clone_request(&source, Some("Ubuntu"), true),
+        clone_request(&source, Some("Ubuntu"), None, true),
         Err(CloneDeclined::WslDistroMismatch)
     );
 }
@@ -165,10 +175,45 @@ fn does_not_attach_when_the_source_reports_no_distro_but_the_target_is_wsl() {
 fn attaches_when_neither_pane_is_wsl() {
     let source = source(remote(), warp_persistent_master());
 
-    assert!(clone_request(&source, None, true).is_ok());
+    assert!(clone_request(&source, None, None, true).is_ok());
 }
 
 /// The whole point of the phase: the new pane lands where the source pane was, not in the remote
+/// `warp_ssh_helper` exists only in the bash, zsh and fish bootstraps. A pane spawned with
+/// PowerShell would run the replayed `ssh` as a plain command and dial the host itself,
+/// prompting for the credentials the whole feature exists to avoid.
+#[test]
+fn declines_when_the_new_pane_runs_a_shell_without_the_wrapper() {
+    let source = source(remote(), warp_persistent_master());
+
+    let declined = clone_request(&source, None, Some(ShellType::PowerShell), true)
+        .expect_err("PowerShell defines no ssh wrapper");
+
+    assert_eq!(declined, CloneDeclined::TargetShellHasNoWrapper);
+}
+
+/// Every shell that carries the wrapper still attaches.
+#[test]
+fn attaches_for_every_shell_that_carries_the_wrapper() {
+    let source = source(remote(), warp_persistent_master());
+
+    for shell in [ShellType::Bash, ShellType::Zsh, ShellType::Fish] {
+        assert!(
+            clone_request(&source, None, Some(shell), true).is_ok(),
+            "{shell:?} carries the wrapper"
+        );
+    }
+}
+
+/// No chosen shell means the pane inherits the default, which carries the wrapper by
+/// construction: the source pane warpified through it.
+#[test]
+fn attaches_when_the_new_pane_inherits_the_default_shell() {
+    let source = source(remote(), warp_persistent_master());
+
+    assert!(clone_request(&source, None, None, true).is_ok());
+}
+
 /// The population the fallback rate is about: the user split a warpified SSH pane and got a local
 /// one. A pane the feature could never have served still counts — the user experienced the same
 /// thing — and stays separable by reason.
@@ -273,6 +318,7 @@ fn the_feature_flag_closes_the_gate_over_an_enabled_setting() {
         clone_request(
             &source(remote(), warp_persistent_master()),
             None,
+            None,
             gate.is_open()
         ),
         Err(CloneDeclined::Disabled)
@@ -293,6 +339,7 @@ fn ssh_warpification_off_closes_the_gate_over_an_enabled_setting() {
     assert_eq!(
         clone_request(
             &source(remote(), warp_persistent_master()),
+            None,
             None,
             gate.is_open()
         ),

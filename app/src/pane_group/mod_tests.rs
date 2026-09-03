@@ -4069,7 +4069,7 @@ fn ssh_clone_gate_is_closed_while_the_feature_flag_is_off() {
     });
 }
 
-/// The close seam for a pane's SSH sessions (GH5409 Phase 10).
+/// The close seam for a pane's SSH sessions.
 ///
 /// `TerminalView` owns the recorded sessions and the release, and `view_tests.rs` pins that
 /// behavior. What can only be pinned here is the wiring: that the real

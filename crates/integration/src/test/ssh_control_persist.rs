@@ -152,6 +152,57 @@ pub fn test_ssh_wrapper_persist_adds_control_persist_when_enabled() -> Builder {
     )
 }
 
+/// A persistent master must not be named for the pane.
+///
+/// The socket is `$SSH_SOCKET_DIR/$WARP_SESSION_ID`, which is unique only while the master dies
+/// with its `ssh`. `ControlPersist` ends that, so a second `ssh` in the same pane would find the
+/// socket still there: OpenSSH warns, disables multiplexing, and leaves that session unsplittable
+/// — and if it reached a different host, a live master for the *previous* host sits at the path a
+/// split would attach to. The connection's own id is appended so each master gets its own socket.
+pub fn test_ssh_wrapper_persist_names_the_socket_per_connection() -> Builder {
+    wrapped_ssh_with_stub(
+        "/tmp/warp-persist-socket",
+        true,  /*persist_enabled*/
+        false, /*control_check_succeeds*/
+    )
+    .with_step(execute_command_for_single_terminal_in_tab(
+        0,
+        "ssh warp-persist-test-host".to_string(),
+        ExpectedExitStatus::Success,
+        (),
+    ))
+    .with_step(
+        new_step_with_default_assertions("Assert a persistent master's socket carries a suffix")
+            .add_assertion(assert_last_command_block_matches(
+                r"FAKESSH_OPT ControlPath=.*/[0-9]+-[0-9]+",
+            )),
+    )
+}
+
+/// The complement: with the feature off the master dies with its `ssh`, so the pane-named socket
+/// is still unique and the path stays exactly what it is today.
+pub fn test_ssh_wrapper_socket_is_named_for_the_pane_when_disabled() -> Builder {
+    wrapped_ssh_with_stub(
+        "/tmp/warp-persist-socket-off",
+        false, /*persist_enabled*/
+        false, /*control_check_succeeds*/
+    )
+    .with_step(execute_command_for_single_terminal_in_tab(
+        0,
+        "ssh warp-persist-test-host".to_string(),
+        ExpectedExitStatus::Success,
+        (),
+    ))
+    .with_step(
+        new_step_with_default_assertions(
+            "Assert the socket path is unchanged with the feature off",
+        )
+        .add_assertion(assert_last_command_block_does_not_match(
+            r"FAKESSH_OPT ControlPath=.*/[0-9]+-[0-9]+",
+        )),
+    )
+}
+
 /// With the feature off, master lifetime and teardown must be exactly what they
 /// were before this feature existed: no `ControlPersist`, and a session that
 /// reports `persist: false` so the forced `ssh -O exit` still runs.

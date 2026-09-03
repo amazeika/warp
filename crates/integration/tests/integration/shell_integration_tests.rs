@@ -105,6 +105,8 @@ integration_tests! {
     test_ssh_wrapper_persist_adds_control_persist_when_enabled,
     test_ssh_wrapper_persist_omitted_when_disabled,
     test_ssh_wrapper_persist_not_added_when_attaching,
+    test_ssh_wrapper_persist_names_the_socket_per_connection,
+    test_ssh_wrapper_socket_is_named_for_the_pane_when_disabled,
 
     // Tests of remote server behavior.
     test_remote_server_connect_bash,

@@ -9271,7 +9271,6 @@ impl TerminalView {
         self.ssh_clone_command_started = false;
     }
 
-
     /// Like `is_long_running`, but also requires the user to be in control of the command
     /// (i.e. the user ran it, or took it over from the agent). Returns `false` for commands
     /// that are currently being driven by the agent.
@@ -11241,7 +11240,6 @@ impl TerminalView {
 
     fn on_user_block_completed(&mut self, block_id: &BlockId, ctx: &mut ViewContext<Self>) {
         self.model.lock().end_notify_on_ssh_login_complete();
-
 
         // If the block that just ended was an agent-requested long running command for which the user took over control,
         // and the user exited the command, we should resume the conversation.

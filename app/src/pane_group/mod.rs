@@ -4035,6 +4035,17 @@ impl PaneGroup {
         // The new pane spawns the shell chosen for it, so that shell's distro is the distro the
         // socket would have to be reachable from.
         let target_wsl_distro = chosen_shell.and_then(AvailableShell::wsl_distro);
+        // The shell that will run the replayed `ssh`, which decides whether it reaches the SSH
+        // wrapper at all. `None` means the pane inherits the default shell.
+        let target_shell = chosen_shell
+            .and_then(AvailableShell::get_valid_shell_path_and_type)
+            .and_then(|launch| match launch {
+                ShellLaunchData::Executable { shell_type, .. }
+                | ShellLaunchData::MSYS2 { shell_type, .. } => Some(shell_type),
+                // A WSL or sandbox shell names no type here; the distro gate above already
+                // covers WSL, and a sandbox is not a destination this feature can reach.
+                ShellLaunchData::WSL { .. } | ShellLaunchData::DockerSandbox { .. } => None,
+            });
         // Warpification is the load-bearing conjunct, not a courtesy: a pane spawned with the SSH
         // wrapper off carries `WARP_USE_SSH_WRAPPER=0`, so its bootstrap never calls
         // `warp_ssh_helper` and never reads `ATTACH_CONTROL_PATH_ENV`. The replayed `ssh` would
@@ -4049,6 +4060,7 @@ impl PaneGroup {
         match clone_request(
             &source,
             target_wsl_distro.as_deref(),
+            target_shell,
             Self::ssh_clone_gate(ctx).is_open(),
         ) {
             Ok(request) => {

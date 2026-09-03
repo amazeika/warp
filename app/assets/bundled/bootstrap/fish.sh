@@ -724,7 +724,18 @@ if test "$WARP_IS_LOCAL_SHELL_SESSION" = "1"
         # master is alive with `ssh -O check`. Both probes are local-only
         # commands. On any failure we fall back to creating a Warp-owned
         # master, preserving the existing behavior.
+        # A Warp-owned master's socket is named for the pane, which is unique only
+        # while the master dies with the `ssh` that created it. `ControlPersist` ends
+        # that: the master outlives its `ssh`, so a second `ssh` in the same pane finds
+        # the socket still there and OpenSSH warns and disables multiplexing. That
+        # session is then unsplittable, and if it reached a different host there is a
+        # live master for the *previous* host sitting at the path a split would attach
+        # to. Name the socket for the connection instead -- but only where the lifetime
+        # actually changed, so a build with the flag off keeps exactly today's paths.
         set -l control_path "$SSH_SOCKET_DIR/$WARP_SESSION_ID"
+        if test "$WARP_SSH_CONTROL_PERSIST" = "1"
+            set control_path "$control_path-$remote_session_id"
+        end
         set -l control_master_mode "yes"
         set -l external_control_master "false"
 

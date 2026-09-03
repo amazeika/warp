@@ -5026,7 +5026,7 @@ fn test_tools_panel_warp_drive_toggle_updates_available_views() {
     });
 }
 
-/// Releasing a closed tab's SSH sessions (GH5409 Phase 10).
+/// Releasing a closed tab's SSH sessions.
 ///
 /// `clean_up_panes` — the only other source of a `Closed` detach for a whole tab — runs solely
 /// when an undo entry expires. A tab removed without an undo entry therefore has exactly one
@@ -5105,7 +5105,7 @@ mod ssh_session_release_on_tab_close {
     }
 }
 
-/// Capturing a closing window's SSH sessions (GH5409 Phase 12).
+/// Capturing a closing window's SSH sessions.
 ///
 /// `Workspace::on_window_closed` is the last point at which a closing window's panes are
 /// reachable: `AppContext::handle_window_closed` calls it for every view while the window is still

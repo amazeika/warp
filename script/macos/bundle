@@ -442,8 +442,10 @@ elif [[ $RELEASE_CHANNEL = "oss" ]]; then
 fi
 
 # The oss branch above rebuilds FEATURES from scratch, so anything given with
-# --features has to be re-applied here or it is silently dropped.
-if [ -n "$EXTRA_FEATURES" ]; then
+# --features has to be re-applied here or it is silently dropped. Only that
+# branch discards them; every other channel appends, and re-applying there would
+# list each feature twice.
+if [ -n "$EXTRA_FEATURES" ] && [[ $RELEASE_CHANNEL = "oss" ]]; then
     FEATURES="$FEATURES$EXTRA_FEATURES"
 fi
 

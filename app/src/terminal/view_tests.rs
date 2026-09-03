@@ -10487,7 +10487,7 @@ mod in_band_metadata_keeps_the_working_directory {
     }
 }
 
-/// Releasing the remote-server clients that hold a pane's `ControlMaster`s open (GH5409 Phase 10).
+/// Releasing the remote-server clients that hold a pane's `ControlMaster`s open.
 ///
 /// The master itself is never stopped here — a persistent one exists so a split can still be
 /// attached to it. What these pin is that Warp stops being a *client* of it, because until every

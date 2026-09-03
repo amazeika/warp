@@ -64,11 +64,12 @@ fn socket_to_force_exit(control_path: &ControlPath) -> Option<&std::path::Path> 
             socket_path,
             persist: true,
         } => {
-            // TODO(doubt): this trusts ControlPersist's idle timeout to reap the
-            // master, but the timeout only starts once every multiplexed client
-            // is gone -- and Warp's own proxy child is released only by
-            // `deregister_session`. See "Does ControlPersist need a last-client
-            // check after all?" in specs/GH5409/design.md.
+            // This trusts ControlPersist's idle timeout to reap the master, but
+            // that timeout only starts once every multiplexed client is gone --
+            // and Warp's own proxy child is released only by
+            // `deregister_session`. A leaked proxy would therefore hold the
+            // master open indefinitely; if that is ever observed, this needs a
+            // last-client check rather than an unconditional early return.
             log::info!(
                 "stop_control_master: leaving persistent ControlMaster at {} to expire on its \
                  idle timeout",
