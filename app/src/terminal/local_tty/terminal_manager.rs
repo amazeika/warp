@@ -854,6 +854,14 @@ impl<S> TerminalManager<S> {
                 .reuse_existing_control_master
                 .value();
 
+        // Gated on the setting as well as the flag, because this one changes the
+        // lifetime of every Warp SSH connection: a user who declined the feature
+        // must not pay for masters that outlive the `ssh` that created them. Both
+        // the rule and the reads live beside the split gate, so a test pins them
+        // rather than this untested spawn path.
+        let clone_ssh_on_split =
+            crate::terminal::ssh::clone_on_split::clone_ssh_on_split_enabled(ctx);
+
         let size: SizeInfo = model.lock().block_list().size().to_owned();
         let options = PtyOptions {
             size,
@@ -863,6 +871,7 @@ impl<S> TerminalManager<S> {
             env_vars,
             enable_ssh_wrapper,
             reuse_ssh_control_master,
+            clone_ssh_on_split,
             shell_debug_mode: is_shell_debug_mode_enabled,
             honor_ps1: is_honor_ps1_enabled,
             node_version_chip_enabled,

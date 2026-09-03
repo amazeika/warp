@@ -842,6 +842,16 @@ pub enum FeatureFlag {
     /// for command execution.
     SshRemoteServer,
 
+    /// Gates cloning the SSH connection when a warpified SSH pane is split, so
+    /// the new pane multiplexes onto the ControlMaster its source already
+    /// authenticated instead of dialing a second time.
+    ///
+    /// Also gates `ControlPersist` on Warp-owned masters. That part changes the
+    /// lifetime of *every* Warp SSH connection, split or not, so it must stay
+    /// behind this flag: with the flag off, master lifetime and teardown are
+    /// byte-for-byte the pre-feature behavior.
+    CloneSshOnSplit,
+
     /// Redux of the setup/initial user query UI for cloud mode.
     CloudModeSetupV2,
 

@@ -5025,3 +5025,229 @@ fn test_tools_panel_warp_drive_toggle_updates_available_views() {
         });
     });
 }
+
+/// Releasing a closed tab's SSH sessions.
+///
+/// `clean_up_panes` — the only other source of a `Closed` detach for a whole tab — runs solely
+/// when an undo entry expires. A tab removed without an undo entry therefore has exactly one
+/// chance to release the per-pane resources that outlive the view, and these pin that it takes it.
+mod ssh_session_release_on_tab_close {
+    use remote_server::manager::RemoteServerManager;
+
+    use super::*;
+
+    /// Removes the active tab with `add_to_undo_stack`, after recording an SSH session on its
+    /// terminal pane. Returns whether the manager still tracks that session afterwards.
+    fn still_tracked_after_tab_close(add_to_undo_stack: bool) -> bool {
+        let tracked = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let tracked_for_closure = tracked.clone();
+        App::test((), |mut app| {
+            let tracked = tracked_for_closure;
+            async move {
+                initialize_app(&mut app);
+                let manager = RemoteServerManager::handle(&app);
+                let workspace = mock_workspace(&mut app);
+                let session_id = warp_core::SessionId::from(1);
+
+                manager.update(&mut app, |manager, _ctx| {
+                    manager.seed_connecting_session_for_test(session_id);
+                });
+
+                workspace.update(&mut app, |workspace, ctx| {
+                    // A second tab, so removing the first does not close the window instead.
+                    workspace.add_terminal_tab(false, ctx);
+                    let pane_group = workspace.active_tab_pane_group();
+                    pane_group.update(ctx, |pane_group, ctx| {
+                        let terminal_view = pane_group
+                            .terminal_views(ctx)
+                            .into_iter()
+                            .next()
+                            .expect("the new tab has a terminal pane");
+                        terminal_view.update(ctx, |view: &mut TerminalView, _ctx| {
+                            view.record_ssh_wrapper_session_for_test(session_id);
+                        });
+                    });
+                    workspace.remove_tab(
+                        workspace.active_tab_index(),
+                        add_to_undo_stack,
+                        true,
+                        ctx,
+                    );
+                });
+                app.update(|_| ());
+
+                manager.read(&app, |manager, _ctx| {
+                    tracked.store(
+                        manager.tracks_session(session_id),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                });
+            }
+        });
+        tracked.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// A tab removed without an undo entry is not necessarily closed — a tab dragged to another
+    /// window is removed exactly that way, and its panes carry on there. Detaching them as
+    /// `Closed` would clear their AI conversations and delete their blocks, so the detach stays
+    /// reversible and the sessions stay with the panes.
+    #[test]
+    fn a_tab_removed_without_an_undo_entry_keeps_its_sessions() {
+        assert!(
+            still_tracked_after_tab_close(false),
+            "a tab removed without an undo entry may have been moved, not closed"
+        );
+    }
+
+    #[test]
+    fn a_tab_closed_onto_the_undo_stack_keeps_its_sessions() {
+        assert!(
+            still_tracked_after_tab_close(true),
+            "a restorable tab comes back to the same connection, so its sessions must survive"
+        );
+    }
+}
+
+/// Capturing a closing window's SSH sessions.
+///
+/// `Workspace::on_window_closed` is the last point at which a closing window's panes are
+/// reachable: `AppContext::handle_window_closed` calls it for every view while the window is still
+/// registered, then removes the window outright. Everything downstream — the
+/// `on_window_will_close` callback, and the undo entry's eventual discard — runs after that, when
+/// neither `views_of_type` nor `is_window_open` can find anything. So the capture has to happen
+/// here, and these pin that it does and that it respects the one case that must not capture.
+mod ssh_session_capture_on_window_close {
+    use super::*;
+    use crate::terminal::view::TerminalView;
+    use crate::undo_close::UndoCloseStack;
+
+    /// Records one SSH session on the workspace's terminal pane, closes the window, and returns
+    /// the sessions staged for it together with whether the workspace was still resolvable
+    /// afterwards.
+    fn staged_after_window_close(content_transferred: bool) -> (Vec<warp_core::SessionId>, bool) {
+        let result = Arc::new(std::sync::Mutex::new((Vec::new(), true)));
+        let result_for_closure = result.clone();
+        App::test((), |mut app| {
+            let result = result_for_closure;
+            async move {
+                initialize_app(&mut app);
+                let session_id = warp_core::SessionId::from(1);
+
+                let workspace = mock_workspace(&mut app);
+                let window_id = workspace.update(&mut app, |_workspace, ctx| ctx.window_id());
+
+                workspace.update(&mut app, |workspace, ctx| {
+                    let pane_group = workspace.active_tab_pane_group().clone();
+                    pane_group.update(ctx, |pane_group, ctx| {
+                        let terminal_view = pane_group
+                            .terminal_views(ctx)
+                            .into_iter()
+                            .next()
+                            .expect("the workspace opens with a terminal pane");
+                        terminal_view.update(ctx, |view: &mut TerminalView, _ctx| {
+                            view.record_ssh_wrapper_session_for_test(session_id);
+                        });
+                    });
+
+                    // A window closing under `TerminationMode::ContentTransferred` has handed its
+                    // pane groups to another window, where they are still live.
+                    if content_transferred {
+                        workspace.set_suppress_detach_panes_on_window_close(true);
+                    }
+                });
+
+                app.update(|ctx| ctx.close_window_for_test(window_id))
+                    .expect("closing a live window yields its data");
+
+                let staged = app.read(|ctx| {
+                    UndoCloseStack::as_ref(ctx).staged_window_ssh_sessions_for_test(window_id)
+                });
+                let still_resolvable =
+                    app.read(|ctx| ctx.views_of_type::<Workspace>(window_id).is_some());
+
+                *result.lock().expect("uncontended") = (staged, still_resolvable);
+            }
+        });
+        let guard = result.lock().expect("uncontended");
+        guard.clone()
+    }
+
+    #[test]
+    fn a_closing_window_captures_its_sessions_while_they_are_still_reachable() {
+        let (staged, still_resolvable) = staged_after_window_close(false);
+
+        assert_eq!(
+            staged,
+            vec![warp_core::SessionId::from(1)],
+            "the sessions must be captured during the close, since nothing afterwards can reach \
+             the panes that hold them"
+        );
+        assert!(
+            !still_resolvable,
+            "the window is gone from `AppContext::windows` by the time the close returns — this \
+             is why a later capture would find nothing, and the reason to capture during it"
+        );
+    }
+
+    /// A tab closed onto the undo stack has already left `Workspace::tabs`, so the live-tab walk
+    /// cannot see it — but its panes are still alive and still hold their sessions, and once the
+    /// window is gone nothing else can reach them.
+    #[test]
+    fn a_closing_window_also_captures_tabs_waiting_on_the_undo_stack() {
+        let staged = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let staged_for_closure = staged.clone();
+        App::test((), |mut app| {
+            let staged = staged_for_closure;
+            async move {
+                initialize_app(&mut app);
+                let stacked_session = warp_core::SessionId::from(2);
+
+                let workspace = mock_workspace(&mut app);
+                let window_id = workspace.update(&mut app, |_workspace, ctx| ctx.window_id());
+
+                workspace.update(&mut app, |workspace, ctx| {
+                    // A second tab, so closing the first leaves the window standing.
+                    workspace.add_terminal_tab(false, ctx);
+                    let pane_group = workspace.active_tab_pane_group().clone();
+                    pane_group.update(ctx, |pane_group, ctx| {
+                        let terminal_view = pane_group
+                            .terminal_views(ctx)
+                            .into_iter()
+                            .next()
+                            .expect("the new tab has a terminal pane");
+                        terminal_view.update(ctx, |view: &mut TerminalView, _ctx| {
+                            view.record_ssh_wrapper_session_for_test(stacked_session);
+                        });
+                    });
+                    // Onto the undo stack, which removes it from `tabs` while its panes live on.
+                    workspace.remove_tab(workspace.active_tab_index(), true, true, ctx);
+                });
+
+                app.update(|ctx| ctx.close_window_for_test(window_id))
+                    .expect("closing a live window yields its data");
+
+                *staged.lock().expect("uncontended") = app.read(|ctx| {
+                    UndoCloseStack::as_ref(ctx).staged_window_ssh_sessions_for_test(window_id)
+                });
+            }
+        });
+        let captured = staged.lock().expect("uncontended").clone();
+
+        assert!(
+            captured.contains(&warp_core::SessionId::from(2)),
+            "a tab on the undo stack is still this window's pane: after the window closes its own \
+             discard early-returns on a closed window, so this capture is the only one left"
+        );
+    }
+
+    #[test]
+    fn a_window_whose_content_was_transferred_captures_nothing() {
+        let (staged, _) = staged_after_window_close(true);
+
+        assert!(
+            staged.is_empty(),
+            "these panes moved to another window and are still live there: capturing them would \
+             release connections a visible pane is still using"
+        );
+    }
+}

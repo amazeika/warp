@@ -582,13 +582,50 @@ pub enum IsSSHWrapperSession {
     /// socket for the underlying connection.
     Yes {
         socket_path: PathBuf,
-        /// `true` when `socket_path` points at a ControlMaster the user
-        /// already had running (the SSH wrapper attached to it instead of
-        /// creating a Warp-owned one). Warp must not tear down such a
-        /// master on session exit.
+        /// `true` when the wrapper attached to a ControlMaster that already
+        /// existed instead of creating one: either the user's own master, or
+        /// a Warp-owned master belonging to the pane this one was split from.
+        /// This session must not tear down such a master on exit.
         external_control_master: bool,
+        /// `true` when the wrapper created this master with `ControlPersist`,
+        /// so it has already detached from the foreground `ssh`. Teardown
+        /// skips the forced `ssh -O exit` for such a master: that exit exists
+        /// only to stop the foreground process from hanging, and there is no
+        /// longer one to hang.
+        persist: bool,
     },
     No,
+}
+
+/// Whether a ControlMaster path is one Warp is willing to attach to or tear down.
+///
+/// The path is interpolated into the SSH hook JSON that the *remote* host prints back, so the
+/// value reaching us has passed through a machine Warp does not control. `ssh -O check` proves a
+/// socket is live, never that it belongs to the destination that was asked for, so a tampered
+/// path naming another of the user's live masters would multiplex onto the wrong host. The
+/// bootstrap wrappers filter against exactly this set before emitting the path; re-applying it
+/// here means a value that did not survive the round trip intact is rejected rather than trusted.
+fn is_supported_control_path(path: &Path) -> bool {
+    let Some(text) = path.to_str() else {
+        return false;
+    };
+    // `SSH_SOCKET_DIR` is the literal string `~/.ssh` outside the integration channel, and the
+    // wrapper interpolates it inside double quotes, so the path arrives tilde-prefixed and
+    // unexpanded -- `ssh` itself expands it. Requiring a rooted path alone would therefore reject
+    // every master Warp creates.
+    let rooted = path.is_absolute() || text.starts_with("~/");
+    !text.is_empty()
+        && rooted
+        && !path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        && text.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(
+                    character,
+                    '.' | '_' | '/' | '~' | '@' | ':' | '+' | ',' | '-'
+                )
+        })
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -667,10 +704,21 @@ impl SessionInfo {
         active_block_session_id: Option<SessionId>,
     ) -> Self {
         let is_ssh_wrapper_session = match ssh_wrapper_session {
-            Some(ssh_value) => IsSSHWrapperSession::Yes {
-                socket_path: ssh_value.socket_path,
-                external_control_master: ssh_value.external_control_master,
-            },
+            Some(ssh_value) if is_supported_control_path(&ssh_value.socket_path) => {
+                IsSSHWrapperSession::Yes {
+                    socket_path: ssh_value.socket_path,
+                    external_control_master: ssh_value.external_control_master,
+                    persist: ssh_value.persist,
+                }
+            }
+            Some(_) => {
+                // The wrapper applies this same filter before interpolating the path, so a value
+                // that fails it here did not survive the round trip through the remote host
+                // intact. Treat the session as unwrapped: no attach, and no teardown of a socket
+                // whose provenance we no longer trust.
+                report_error!("SSH hook reported an unusable ControlMaster path");
+                IsSSHWrapperSession::No
+            }
             None => IsSSHWrapperSession::No,
         };
 
@@ -1055,6 +1103,12 @@ impl Session {
             self.info.is_ssh_wrapper_session,
             IsSSHWrapperSession::Yes { .. }
         )
+    }
+
+    /// The SSH wrapper payload for this session: the ControlMaster socket plus the ownership and
+    /// lifetime flags a split needs to decide whether it may attach to that master.
+    pub fn ssh_wrapper_session(&self) -> &IsSSHWrapperSession {
+        &self.info.is_ssh_wrapper_session
     }
 
     pub fn is_subshell_or_ssh(&self) -> bool {
@@ -1812,6 +1866,7 @@ pub mod testing {
             self.is_ssh_wrapper_session = IsSSHWrapperSession::Yes {
                 socket_path,
                 external_control_master: false,
+                persist: false,
             };
             self
         }

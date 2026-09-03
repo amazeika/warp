@@ -1015,8 +1015,19 @@ if [[ -z $WARP_BOOTSTRAPPED ]]; then
       }
 
       function warp_ssh_helper() {
+          # Consume the split-pane attach request first, before any other path
+          # can return. Warp sets this only for a pane split out of an SSH
+          # session, so it is normally absent and must be read defensively for
+          # shells running with `setopt nounset`.
+          local attach_control_path="${WARP_SSH_ATTACH_CONTROL_PATH-}"
+          unset WARP_SSH_ATTACH_CONTROL_PATH
+
           local remote_session_id=$(command -p od -An -N8 -tu8 /dev/urandom 2>/dev/null | command -p tr -d ' \n')
           if [[ -z "$remote_session_id" || "$remote_session_id" == "0" ]]; then
+              if [[ -n "$attach_control_path" ]]; then
+                  printf '%s\n' "warp: cannot reuse the SSH connection this pane was split from (could not generate a session id)" >&2
+                  return 1
+              fi
               # If we cannot generate a non-zero random token, run plain SSH instead.
               command ssh "${@:1}"
               return
@@ -1029,6 +1040,10 @@ if [[ -z $WARP_BOOTSTRAPPED ]]; then
           # back to plain SSH. `ssh -G` prints `remotecommand none` when unset.
           local user_remote_command=$(command ssh -G "${@:1}" 2>/dev/null | command -p sed -n 's/^remotecommand //p')
           if [[ -n "$user_remote_command" && "$user_remote_command" != "none" ]]; then
+              if [[ -n "$attach_control_path" ]]; then
+                  printf '%s\n' "warp: cannot reuse the SSH connection this pane was split from (this destination configures its own RemoteCommand)" >&2
+                  return 1
+              fi
               command ssh "${@:1}"
               return
           fi
@@ -1045,10 +1060,52 @@ if [[ -z $WARP_BOOTSTRAPPED ]]; then
           # master is alive with `ssh -O check`. Both probes are local-only
           # commands. On any failure we fall back to creating a Warp-owned
           # master, preserving the existing behavior.
+          # A Warp-owned master's socket is named for the pane, which is unique only
+          # while the master dies with the `ssh` that created it. `ControlPersist` ends
+          # that: the master outlives its `ssh`, so a second `ssh` in the same pane finds
+          # the socket still there and OpenSSH warns and disables multiplexing. That
+          # session is then unsplittable, and if it reached a different host there is a
+          # live master for the *previous* host sitting at the path a split would attach
+          # to. Name the socket for the connection instead -- but only where the lifetime
+          # actually changed, so a build with the flag off keeps exactly today's paths.
           local control_path="$SSH_SOCKET_DIR/$WARP_SESSION_ID"
+          if [[ "${WARP_SSH_CONTROL_PERSIST-}" == "1" ]]; then
+              control_path="$control_path-$remote_session_id"
+          fi
           local control_master_mode="yes"
           local external_control_master="false"
-          if [[ "$WARP_SSH_REUSE_CONTROL_MASTER" == "1" ]]; then
+
+          # Attach mode: multiplex onto the connection the pane we were split
+          # from already authenticated, so the user is not prompted again. The
+          # request itself was consumed at the top of this function.
+          local attach_guard=()
+          if [[ -n "$attach_control_path" ]]; then
+              case "$attach_control_path" in
+                  *[![:alnum:]._/~@:+,-]*)
+                      # Same restriction as the branch below: the path is
+                      # embedded in the SSH hook JSON further down.
+                      printf '%s\n' "warp: cannot reuse the SSH connection this pane was split from (its socket path has unsupported characters)" >&2
+                      return 1
+                      ;;
+              esac
+              if ! command ssh -O check -o ControlPath="$attach_control_path" "${@:1}" >/dev/null 2>&1; then
+                  printf '%s\n' "warp: cannot reuse the SSH connection this pane was split from (that connection is gone)" >&2
+                  return 1
+              fi
+              control_path="$attach_control_path"
+              control_master_mode="no"
+              # `ControlMaster=no` only *prefers* the socket: if the master dies
+              # between the check above and the connection below, OpenSSH dials
+              # the destination directly and prompts for credentials. Neither
+              # option is consulted when the socket is live, so disabling both
+              # transports makes attach mode succeed over the master or fail,
+              # never silently reconnect.
+              attach_guard=(-o ProxyCommand=false -o ProxyJump=none)
+              # We joined this master, we did not create it, so we must never
+              # tear it down. Another pane is still using it, including the one
+              # we were split from.
+              external_control_master="true"
+          elif [[ "$WARP_SSH_REUSE_CONTROL_MASTER" == "1" ]]; then
               local user_control_path=$(command ssh -G "${@:1}" 2>/dev/null | command -p sed -n 's/^controlpath //p')
               case "$user_control_path" in
                   "" | none)
@@ -1072,6 +1129,22 @@ if [[ -z $WARP_BOOTSTRAPPED ]]; then
               esac
           fi
 
+          # A Warp-owned master is given a ControlPersist idle timeout so the
+          # connection outlives the foreground `ssh` that created it and panes
+          # attached to it can be closed in any order. This changes the lifetime of
+          # every Warp SSH connection, split or not, so it is gated on the feature
+          # flag: with the flag off the ssh options below, and so the master's
+          # lifetime and teardown, are exactly what they were before this feature
+          # existed. The remote command still reports persist, as false. A master we
+          # joined rather than created never gets one -- its lifetime is not ours to
+          # extend.
+          local persist="false"
+          local persist_opts=()
+          if [[ "$control_master_mode" == "yes" && "${WARP_SSH_CONTROL_PERSIST-}" == "1" ]]; then
+              persist="true"
+              persist_opts=(-o ControlPersist=60)
+          fi
+
           # Keep remote commands up-to-date with shell.rs & bash.sh.
           # Note that in this command, we're passing a string to the remote shell. Any variable expansions need to be
           # escaped with "''" to avoid the local shell from expanding them before they're passed to the remote shell.
@@ -1080,7 +1153,7 @@ if [[ -z $WARP_BOOTSTRAPPED ]]; then
           # the remote shell is the Bourne shell to avoid asking it to parse later lines that use syntax it doesn't
           # support.
           command ssh -o ControlMaster=$control_master_mode -o ControlPath="$control_path" \
-          -t "${@:1}" \
+          "${attach_guard[@]}" "${persist_opts[@]}" -t "${@:1}" \
 "
 export TERM_PROGRAM='WarpTerminal'
 # Mark the remote side of a Warp-managed SSH session so the bootstrap
@@ -1090,7 +1163,7 @@ export WARP_IS_SSH='1'
 test -n '$WARP_CLIENT_VERSION' && export WARP_CLIENT_VERSION='$WARP_CLIENT_VERSION'
 # Only forward the protocol version if it was set locally (i.e. the HOANotifications feature flag is on).
 test -n '$WARP_CLI_AGENT_PROTOCOL_VERSION' && export WARP_CLI_AGENT_PROTOCOL_VERSION='$WARP_CLI_AGENT_PROTOCOL_VERSION'
-hook="'$(printf "{\"hook\": \"SSH\", \"value\": {\"socket_path\": \"'$control_path'\", \"remote_shell\": \"%s\", \"session_id\": '"$WARP_SESSION_ID"', \"remote_session_id\": '"$remote_session_id"', \"external_control_master\": '"$external_control_master"'}}" "${SHELL##*/}" | command -p od -An -v -tx1 | command -p tr -d " \n")'"
+hook="'$(printf "{\"hook\": \"SSH\", \"value\": {\"socket_path\": \"'$control_path'\", \"remote_shell\": \"%s\", \"session_id\": '"$WARP_SESSION_ID"', \"remote_session_id\": '"$remote_session_id"', \"external_control_master\": '"$external_control_master"', \"persist\": '"$persist"'}}" "${SHELL##*/}" | command -p od -An -v -tx1 | command -p tr -d " \n")'"
 printf '$OSC_START$DCS_JSON_MARKER$OSC_PARAM_SEPARATOR%s$OSC_END' "'$hook'"
 
 if test "'"${SHELL##*/}" != "bash" -a "${SHELL##*/}" != "zsh"'"; then

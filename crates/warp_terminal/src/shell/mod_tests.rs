@@ -356,6 +356,47 @@ fn fish_escapes_single_quote_with_backslash() {
     assert_eq!(result, r"it\'s a test");
 }
 
+/// Fish honours backslash escapes inside single quotes, so a literal backslash has to be escaped
+/// too. Escaping only the quote left `\'` able to close the quoted string early, which turned
+/// everything after it into shell code -- verified against fish before the fix.
+#[test]
+fn fish_escapes_backslashes_so_a_quote_cannot_close_the_string_early() {
+    let result = shell_escape_single_quotes(r"a\'; echo INJECTED #", ShellType::Fish);
+
+    assert_eq!(result, r"a\\\'; echo INJECTED #");
+}
+
+#[test]
+fn fish_escapes_a_lone_backslash() {
+    assert_eq!(
+        shell_escape_single_quotes(r"/srv/back\slash", ShellType::Fish),
+        r"/srv/back\\slash"
+    );
+}
+
+/// A trailing backslash is the minimal breakout: unescaped, it consumed the closing quote of the
+/// surrounding `'...'` and left the string open.
+#[test]
+fn fish_escapes_a_trailing_backslash() {
+    assert_eq!(
+        shell_quote_arg(r"/srv/trailing\", ShellType::Fish),
+        r"'/srv/trailing\\'"
+    );
+}
+
+/// Bash and Zsh ignore backslashes inside single quotes, so doubling one there would corrupt the
+/// path. Only the Fish arm may escape it.
+#[test]
+fn posix_shells_leave_backslashes_alone() {
+    for shell_type in [ShellType::Bash, ShellType::Zsh] {
+        assert_eq!(
+            shell_escape_single_quotes(r"/srv/back\slash", shell_type),
+            r"/srv/back\slash",
+            "{shell_type:?} must not touch backslashes"
+        );
+    }
+}
+
 #[test]
 fn powershell_escapes_single_quote_by_doubling() {
     let result = shell_escape_single_quotes("it's a test", ShellType::PowerShell);

@@ -3976,3 +3976,214 @@ fn test_undo_close_keeps_a_file_pane_watching_its_file() {
         });
     });
 }
+
+/// `CloneGate` proves the rule; this proves the wiring. Each condition has to come from its own
+/// real source, and nothing in `clone_on_split_tests.rs` can catch a literal accidentally left in
+/// place of one of these reads — that would satisfy the rule while ignoring the user entirely.
+#[test]
+fn ssh_clone_gate_reads_each_condition_from_its_own_source() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let _flag = FeatureFlag::CloneSshOnSplit.override_enabled(true);
+        WarpifySettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings
+                .enable_ssh_warpification
+                .set_value(true, ctx)
+                .unwrap();
+        });
+        SshSettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.clone_ssh_on_split.set_value(true, ctx).unwrap();
+        });
+
+        app.read(|ctx| {
+            assert_eq!(
+                PaneGroup::ssh_clone_gate(ctx),
+                CloneGate {
+                    feature_flag: true,
+                    ssh_warpification: true,
+                    setting: true,
+                }
+            );
+        });
+
+        // Each source, turned off on its own, has to reach its own field.
+        SshSettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.clone_ssh_on_split.set_value(false, ctx).unwrap();
+        });
+        app.read(|ctx| {
+            let gate = PaneGroup::ssh_clone_gate(ctx);
+            assert!(
+                !gate.setting,
+                "the opt-in must come from the user's setting"
+            );
+            assert!(gate.ssh_warpification && gate.feature_flag);
+            assert!(!gate.is_open());
+        });
+
+        SshSettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.clone_ssh_on_split.set_value(true, ctx).unwrap();
+        });
+        WarpifySettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings
+                .enable_ssh_warpification
+                .set_value(false, ctx)
+                .unwrap();
+        });
+        app.read(|ctx| {
+            let gate = PaneGroup::ssh_clone_gate(ctx);
+            assert!(
+                !gate.ssh_warpification,
+                "warpification must come from the warpify setting, not the clone setting"
+            );
+            assert!(gate.setting && gate.feature_flag);
+            assert!(!gate.is_open());
+        });
+    });
+}
+
+/// The flag is the rollout control, so it has to close the gate even with both settings on.
+#[test]
+fn ssh_clone_gate_is_closed_while_the_feature_flag_is_off() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        WarpifySettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings
+                .enable_ssh_warpification
+                .set_value(true, ctx)
+                .unwrap();
+        });
+        SshSettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.clone_ssh_on_split.set_value(true, ctx).unwrap();
+        });
+
+        app.read(|ctx| {
+            let gate = PaneGroup::ssh_clone_gate(ctx);
+            assert!(!gate.feature_flag);
+            assert!(
+                !gate.is_open(),
+                "the flag must win over a user who opted in"
+            );
+        });
+    });
+}
+
+/// The close seam for a pane's SSH sessions.
+///
+/// `TerminalView` owns the recorded sessions and the release, and `view_tests.rs` pins that
+/// behavior. What can only be pinned here is the wiring: that the real
+/// `TerminalManager<TerminalView>::on_view_detached` consults the detach type and actually calls
+/// the release. That one line is what the phase hangs on — the `ModelEvent::Exit` backstop is not
+/// delivered on an ordinary close — so without this a refactor could drop it silently.
+mod ssh_session_release_on_detach {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use remote_server::manager::RemoteServerManager;
+    use warp_core::SessionId;
+
+    use super::*;
+
+    /// Seeds a session in the manager, records it on the pane's terminal view, then detaches the
+    /// pane's real manager with `detach_type`. Returns whether the manager still tracks it.
+    fn still_tracked_after_detach(detach_type: DetachType) -> bool {
+        let tracked = Arc::new(AtomicBool::new(true));
+        let tracked_for_closure = tracked.clone();
+        App::test((), |mut app| {
+            let tracked = tracked_for_closure;
+            async move {
+                initialize_app(&mut app);
+                let manager = RemoteServerManager::handle(&app);
+                let pane_group = mock_pane_group(&mut app, Default::default());
+                let session_id = SessionId::from(1);
+
+                manager.update(&mut app, |manager, _ctx| {
+                    manager.seed_connecting_session_for_test(session_id);
+                });
+
+                pane_group.update(&mut app, |pane_group, ctx| {
+                    let terminal_pane = pane_group.terminal_session_by_pane_index(0).unwrap();
+                    terminal_pane.terminal_view(ctx).update(ctx, |view, _ctx| {
+                        view.record_ssh_wrapper_session_for_test(session_id);
+                    });
+                    let terminal_manager_handle = terminal_pane.terminal_manager(ctx);
+                    terminal_manager_handle.update(ctx, |terminal_manager, ctx| {
+                        terminal_manager.on_view_detached(detach_type, ctx);
+                    });
+                });
+
+                manager.read(&app, |manager, _ctx| {
+                    tracked.store(manager.tracks_session(session_id), Ordering::Relaxed);
+                });
+            }
+        });
+        tracked.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn a_permanent_close_releases_through_the_real_detach_seam() {
+        assert!(
+            !still_tracked_after_detach(DetachType::Closed),
+            "on_view_detached must release the pane's sessions on a permanent close, or the \
+             ControlMaster never goes idle"
+        );
+    }
+
+    #[test]
+    fn a_reversible_detach_keeps_the_panes_sessions() {
+        assert!(
+            still_tracked_after_detach(DetachType::HiddenForClose),
+            "a tab hidden for close comes back to the same connection"
+        );
+        assert!(
+            still_tracked_after_detach(DetachType::Moved),
+            "a moved pane keeps its connection"
+        );
+    }
+}
+
+/// `WARP_SSH_CONTROL_PERSIST` is decided at pane spawn from the same flag and setting, through
+/// `clone_ssh_on_split_enabled`. The rule itself is pinned in `clone_on_split_tests`; this pins the
+/// wiring, so a literal left in place of either read cannot pass.
+#[test]
+fn test_control_persist_reads_the_flag_and_the_setting_from_their_real_sources() {
+    use crate::terminal::ssh::clone_on_split::clone_ssh_on_split_enabled;
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let _flag = FeatureFlag::CloneSshOnSplit.override_enabled(true);
+        SshSettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.clone_ssh_on_split.set_value(true, ctx).unwrap();
+        });
+        app.read(|ctx| {
+            assert!(
+                clone_ssh_on_split_enabled(ctx),
+                "flag and setting both on must enable ControlPersist at spawn"
+            );
+        });
+
+        SshSettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.clone_ssh_on_split.set_value(false, ctx).unwrap();
+        });
+        app.read(|ctx| {
+            assert!(
+                !clone_ssh_on_split_enabled(ctx),
+                "the opt-in must come from the user's setting, not the flag alone"
+            );
+        });
+
+        SshSettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.clone_ssh_on_split.set_value(true, ctx).unwrap();
+        });
+        drop(_flag);
+        let _flag_off = FeatureFlag::CloneSshOnSplit.override_enabled(false);
+        app.read(|ctx| {
+            assert!(
+                !clone_ssh_on_split_enabled(ctx),
+                "the setting alone must not enable it in a build where the flag is off"
+            );
+        });
+    })
+}

@@ -297,7 +297,7 @@ use crate::notification::NotificationContext;
 use crate::palette::PaletteMode;
 #[cfg(feature = "local_fs")]
 use crate::pane_group::FilePane;
-use crate::pane_group::pane::ActionOrigin;
+use crate::pane_group::pane::{ActionOrigin, DetachType};
 use crate::pane_group::{
     self, AIFactPane, AnyPaneContent, ChildAgentOrigin, CodeDiffPane, CodePane, CodeReviewPanelArg,
     CustomRouterEditorPane, Direction as PaneGroupDirection, Direction, EnvironmentManagementPane,
@@ -12122,7 +12122,23 @@ impl Workspace {
                     ctx,
                 );
 
-                pane_group.detach_panes_for_close(&working_directories_model, ctx);
+                // Always reversible, whatever the undo stack holds. `add_to_undo_stack` says
+                // whether the tab can be *restored*, not whether its panes are gone: a tab moved
+                // to another window is removed without an undo entry and its panes carry on
+                // there. Detaching those as `Closed` would clear their AI conversations and
+                // delete their blocks, so a drag between windows would destroy real history.
+                //
+                // The cost is that a tab closed without an undo entry — a rare path, not an
+                // ordinary close — never releases its SSH sessions, so the remote-server proxy
+                // keeps that `ControlMaster` from going idle. A leak in a rare path is the better
+                // trade until the callers pass a real moved-or-closed signal; the ordinary close
+                // is unaffected, since its undo entry expiring runs `clean_up_panes`, which
+                // detaches as `Closed`.
+                pane_group.detach_panes_for_close(
+                    DetachType::HiddenForClose,
+                    &working_directories_model,
+                    ctx,
+                );
             });
         }
 
@@ -23603,6 +23619,16 @@ impl Workspace {
         // Logging out should mimic the same behaviour as closing a window.
         // This gives views a chance to clean up any state through on_view_detached before being dropped.
         self.on_window_closed(ctx);
+
+        // But no window actually closed, so nothing will ever deliver the `ClosedWindowData` that
+        // drains what the line above staged. These panes are dropped immediately after this
+        // returns without a `Closed` detach, so releasing now is both correct and the only chance:
+        // left staged, the entry would sit under a still-open window and be merged into that
+        // window's own sessions by a later real close.
+        let window_id = ctx.window_id();
+        UndoCloseStack::handle(ctx).update(ctx, |stack, ctx| {
+            stack.release_staged_window_ssh_sessions(window_id, ctx);
+        });
     }
 
     fn focus_openwarp_launch_modal(&mut self, ctx: &mut ViewContext<Self>) {
@@ -27861,11 +27887,39 @@ impl View for Workspace {
     /// Update this workspace when it has been closed, but may still be restored.
     fn on_window_closed(&mut self, ctx: &mut ViewContext<Self>) {
         if !self.suppress_detach_panes_on_window_close {
+            // The last point at which this window's panes are reachable. `AppContext::
+            // handle_window_closed` calls this for every view while the window is still
+            // registered, then removes it, so by the time `on_window_will_close` hands the
+            // `ClosedWindowData` to the undo stack neither `views_of_type` nor `is_window_open`
+            // can find anything here. Capture now; the stack releases later, if and only if the
+            // window turns out to be unrestorable.
+            let mut ssh_sessions: Vec<SessionId> = Vec::new();
             for pane_group in self.tab_views() {
                 pane_group.update(ctx, |pane_group, ctx| {
+                    ssh_sessions.extend(pane_group.snapshot_ssh_wrapper_sessions(ctx));
                     pane_group.detach_panes(ctx);
                 });
             }
+
+            // Tabs of this workspace that are themselves waiting on the undo stack. They left
+            // `tabs` when they were closed, so the loop above cannot see them, but their panes
+            // are still live and still hold sessions — and once this window is gone nothing can
+            // reach them, since their own discard early-returns on a closed window. Not detached
+            // here: they are already detached, and the window close does not change whether they
+            // can be restored.
+            let workspace_id = ctx.view_id();
+            let stacked_pane_groups =
+                UndoCloseStack::as_ref(ctx).stacked_tab_pane_groups(workspace_id);
+            for pane_group in stacked_pane_groups {
+                ssh_sessions.extend(pane_group.read(ctx, |pane_group, ctx| {
+                    pane_group.snapshot_ssh_wrapper_sessions(ctx)
+                }));
+            }
+
+            let window_id = ctx.window_id();
+            UndoCloseStack::handle(ctx).update(ctx, |stack, _| {
+                stack.stage_window_ssh_sessions(window_id, ssh_sessions);
+            });
         }
 
         let window_id = ctx.window_id();
@@ -28240,7 +28294,7 @@ impl Workspace {
 
         let working_directories_model = self.working_directories_model.clone();
         placeholder_pane_group.update(ctx, |pg, ctx| {
-            pg.detach_panes_for_close(&working_directories_model, ctx);
+            pg.detach_panes_for_close(DetachType::HiddenForClose, &working_directories_model, ctx);
         });
         self.pending_pane_group_transfer = false;
         ctx.dispatch_global_action("workspace:save_app", ());

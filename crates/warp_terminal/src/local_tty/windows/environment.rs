@@ -24,6 +24,10 @@ const PROMPT_NODE_VERSION_ENABLED_NAME: &str = "WARP_PROMPT_NODE_VERSION_ENABLED
 const INITIAL_WORKING_DIR_NAME: &str = "WARP_INITIAL_WORKING_DIR";
 const USE_SSH_WRAPPER_NAME: &str = "WARP_USE_SSH_WRAPPER";
 const SSH_REUSE_CONTROL_MASTER_NAME: &str = "WARP_SSH_REUSE_CONTROL_MASTER";
+const SSH_CONTROL_PERSIST_NAME: &str = "WARP_SSH_CONTROL_PERSIST";
+/// Set per-pane (through `PtyOptions::env_vars`) for a pane split out of an SSH session, so it
+/// only needs listing here to be forwarded into WSL.
+const SSH_ATTACH_CONTROL_PATH_NAME: &str = "WARP_SSH_ATTACH_CONTROL_PATH";
 const SHELL_DEBUG_MODE_NAME: &str = "WARP_SHELL_DEBUG_MODE";
 const TERM_PROGRAM_NAME: &str = "TERM_PROGRAM";
 const IS_LOCAL_SESSION_NAME: &str = "WARP_IS_LOCAL_SHELL_SESSION";
@@ -100,6 +104,13 @@ pub(super) fn get_shell_environment_variables(options: &PtyOptions) -> Vec<u16> 
             value: (options.reuse_ssh_control_master as usize)
                 .to_string()
                 .into(),
+        },
+    );
+    env.insert(
+        map_key(SSH_CONTROL_PERSIST_NAME.into()),
+        EnvEntry {
+            preferred_key: SSH_CONTROL_PERSIST_NAME.into(),
+            value: (options.clone_ssh_on_split as usize).to_string().into(),
         },
     );
     env.insert(
@@ -219,6 +230,8 @@ fn wsl_env_allowlist(include_initial_working_dir: bool) -> OsString {
         format!("{HONOR_PS1_NAME}/u"),
         format!("{USE_SSH_WRAPPER_NAME}/u"),
         format!("{SSH_REUSE_CONTROL_MASTER_NAME}/u"),
+        format!("{SSH_CONTROL_PERSIST_NAME}/u"),
+        format!("{SSH_ATTACH_CONTROL_PATH_NAME}/u"),
         format!("{SHELL_DEBUG_MODE_NAME}/u"),
         format!("{TERM_PROGRAM_NAME}/u"),
         format!("{IS_LOCAL_SESSION_NAME}/u"),

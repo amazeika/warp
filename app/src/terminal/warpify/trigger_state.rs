@@ -8,7 +8,7 @@ use warpui::{EntityId, SingletonEntity as _, ViewContext, ViewHandle};
 
 use super::success_block::WarpifySuccessBlock;
 use crate::terminal::model::block::BlockId;
-use crate::terminal::model::session::SessionId;
+use crate::terminal::model::session::{BootstrapSessionType, SessionId};
 use crate::terminal::model::terminal_model::SubshellInitializationInfo;
 use crate::terminal::settings::TerminalSettings;
 use crate::terminal::shell::ShellType;
@@ -103,6 +103,10 @@ struct WarpifyTriggerState {
 #[derive(Default)]
 pub struct WarpifyState {
     session_id: Option<SessionId>,
+
+    /// The `ssh` command that started a Warpified remote session, keyed by that session's id so a
+    /// split of it can re-run the command against the connection the session already holds.
+    bound_ssh_session: Option<(SessionId, String)>,
 
     pending_state: Option<WarpifyTriggerState>,
     /// Stores the metadata needed to render any separators above the first block of a subshell.
@@ -308,6 +312,58 @@ impl WarpifyState {
         self.session_id = active_session_id;
     }
 
+    /// Records the `ssh` command that started a Warpified remote session, so a split of that
+    /// session can re-run it against the connection the session already holds.
+    ///
+    /// The command comes from the pending trigger state, not from the caller. That is the form
+    /// warpify detection ran on, so it has already passed `parse_interactive_ssh_command` and is
+    /// alias-expanded: `alias m='ssh -J bastion mini'` binds the real invocation rather than `m`.
+    /// Nothing is bound when it is absent, since an unvalidated command is not replayable.
+    ///
+    /// Only a wrapper-established session binds. A remote session type is not on its own evidence
+    /// of an `ssh` origin: `determine_session_type` decides it by comparing hostnames, so a
+    /// subshell warpified on the remote host or in a container is typed remote too. Those have no
+    /// Warp ControlMaster for a split to attach to. Nor can a session started *inside* a remote
+    /// session ever qualify: the wrapper defines its `ssh` function only under
+    /// `WARP_IS_LOCAL_SHELL_SESSION`, which Warp sets on local PTYs alone.
+    pub fn bind_ssh_command(
+        &mut self,
+        session_id: SessionId,
+        session_type: &BootstrapSessionType,
+        is_ssh_wrapper_session: bool,
+    ) {
+        match session_type {
+            BootstrapSessionType::WarpifiedRemote if is_ssh_wrapper_session => {
+                self.bound_ssh_session = self
+                    .get_pending_ssh_command()
+                    .map(|command| (session_id, command));
+            }
+            BootstrapSessionType::WarpifiedRemote | BootstrapSessionType::Local => {}
+        }
+    }
+
+    /// Releases the binding unconditionally, for a teardown that ends every session in the pane.
+    pub fn release_bound_ssh_command(&mut self) {
+        self.bound_ssh_session = None;
+    }
+
+    /// Releases the binding once its session has ended, so the command cannot outlive it.
+    pub fn release_ssh_command(&mut self, session_id: SessionId) {
+        if self.bound_ssh_session.as_ref().map(|(id, _)| *id) == Some(session_id) {
+            self.bound_ssh_session = None;
+        }
+    }
+
+    /// The `ssh` command that started `active_session_id`'s Warpified remote session.
+    ///
+    /// Returns `None` unless the caller's active session is the one that command started. That
+    /// check is what withholds a command belonging to another session: an outer session the user
+    /// has since left, or one nested inside it.
+    pub fn bound_ssh_command(&self, active_session_id: Option<SessionId>) -> Option<&str> {
+        let (session_id, command) = self.bound_ssh_session.as_ref()?;
+        (Some(*session_id) == active_session_id).then_some(command.as_str())
+    }
+
     /// Called whenever a block is completed, to determine whether a Warpified session
     /// has been completed.
     pub fn get_completed_warpify_session_id(
@@ -324,3 +380,7 @@ impl WarpifyState {
         None
     }
 }
+
+#[cfg(test)]
+#[path = "trigger_state_tests.rs"]
+mod tests;

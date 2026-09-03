@@ -18,6 +18,7 @@ fn remote_proxy_command_quotes_identity_key() {
         PathBuf::from("/tmp/control-master.sock"),
         static_auth_context(),
         true,
+        false,
     );
 
     let command = transport.remote_proxy_command();

@@ -49,6 +49,45 @@ pub fn ssh_args(socket_path: &Path) -> Vec<String> {
     ]
 }
 
+/// The socket `stop_control_master` should force to exit, or `None` when
+/// this master must be left running.
+///
+/// Split out from the spawn so the ownership and persistence rules can be
+/// tested without running `ssh`.
+fn socket_to_force_exit(control_path: &ControlPath) -> Option<&std::path::Path> {
+    match control_path {
+        ControlPath::WarpManaged {
+            socket_path,
+            persist: false,
+        } => Some(socket_path),
+        ControlPath::WarpManaged {
+            socket_path,
+            persist: true,
+        } => {
+            // This trusts ControlPersist's idle timeout to reap the master, but
+            // that timeout only starts once every multiplexed client is gone --
+            // and Warp's own proxy child is released only by
+            // `deregister_session`. A leaked proxy would therefore hold the
+            // master open indefinitely; if that is ever observed, this needs a
+            // last-client check rather than an unconditional early return.
+            log::info!(
+                "stop_control_master: leaving persistent ControlMaster at {} to expire on its \
+                 idle timeout",
+                socket_path.display()
+            );
+            None
+        }
+        ControlPath::UserOwned(socket_path) => {
+            log::info!(
+                "stop_control_master: leaving user-owned ControlMaster at {} running",
+                socket_path.display()
+            );
+            None
+        }
+        ControlPath::None => None,
+    }
+}
+
 /// Runs `ssh -O exit -o ControlPath=<socket_path>` to force the local
 /// SSH `ControlMaster` behind `control_path` to exit immediately,
 /// without waiting for multiplexed channels to finish draining.
@@ -60,10 +99,15 @@ pub fn ssh_args(socket_path: &Path) -> Vec<String> {
 /// `ssh ... remote-server-proxy`) to finish cleanup on the remote
 /// side. Sending `-O exit` bypasses that wait.
 ///
-/// Only [`ControlPath::WarpManaged`] masters are acted on: a
-/// [`ControlPath::UserOwned`] master (the SSH wrapper attached to a
-/// master the user already had running) is left untouched, and
-/// [`ControlPath::None`] is a no-op.
+/// Only a non-persistent [`ControlPath::WarpManaged`] master is acted on.
+/// A [`ControlPath::UserOwned`] master -- one this session attached to
+/// rather than created, whether the user's own or another pane's -- is
+/// left untouched, and
+/// [`ControlPath::None`] is a no-op. A `WarpManaged` master created with
+/// `ControlPersist` is also left alone: it detached from the interactive
+/// `ssh` at connect time, so the hang this function exists to prevent
+/// cannot happen, and other panes are very likely still multiplexed onto
+/// it. It expires on its own idle timeout instead.
 ///
 /// **Only safe to call once the user's shell has already exited** --
 /// for Warp-managed masters this tears down the interactive ssh
@@ -73,16 +117,8 @@ pub fn ssh_args(socket_path: &Path) -> Vec<String> {
 /// Fire-and-forget. Errors are logged but not propagated: at teardown
 /// time there is nothing useful to do with them.
 pub async fn stop_control_master(control_path: &ControlPath) {
-    let socket_path = match control_path {
-        ControlPath::WarpManaged(socket_path) => socket_path,
-        ControlPath::UserOwned(socket_path) => {
-            log::info!(
-                "stop_control_master: leaving user-owned ControlMaster at {} running",
-                socket_path.display()
-            );
-            return;
-        }
-        ControlPath::None => return,
+    let Some(socket_path) = socket_to_force_exit(control_path) else {
+        return;
     };
     let args = ssh_args(socket_path);
     let result = async {
@@ -245,3 +281,7 @@ pub async fn scp_upload(
         ))
     }
 }
+
+#[cfg(test)]
+#[path = "ssh_tests.rs"]
+mod tests;

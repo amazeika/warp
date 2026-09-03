@@ -2809,6 +2809,17 @@ impl AppContext {
         result
     }
 
+    /// Closes `window_id` through the production close path, returning the same
+    /// [`ClosedWindowData`] the platform callback hands to the undo stack.
+    ///
+    /// Exists because the test platform's `close_window_async` is a no-op, so no test can reach
+    /// [`Self::handle_window_closed`] the way a real platform close does. Callers stand in for the
+    /// `on_window_will_close` callback themselves.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn close_window_for_test(&mut self, window_id: WindowId) -> Option<ClosedWindowData> {
+        self.handle_window_closed(window_id)
+    }
+
     pub fn reopen_closed_window(&mut self, data: ClosedWindowData) {
         let ClosedWindowData {
             window_id,

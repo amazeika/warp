@@ -418,6 +418,7 @@ impl DProtoHook {
                 "external_control_master" => {
                     value.external_control_master = v.parse::<bool>().unwrap_or(false)
                 }
+                "persist" => value.persist = v.parse::<bool>().unwrap_or(false),
                 _ => {
                     log::warn!("Tried to add unknown field {key} to SSH hook");
                 }
@@ -927,6 +928,13 @@ pub struct SSHValue {
     /// `false` for hooks emitted by older bootstrap scripts.
     #[serde(default)]
     pub external_control_master: bool,
+    /// `true` when the wrapper created this master with `ControlPersist`, so it
+    /// has already detached from the foreground `ssh`. Teardown must then skip
+    /// the forced `ssh -O exit`, which exists only to stop that foreground
+    /// process from hanging. Defaults to `false`, which preserves the forced
+    /// exit for hooks emitted by older bootstrap scripts.
+    #[serde(default)]
+    pub persist: bool,
 }
 
 /// Received from the pty after the shell session has been initialized, marking

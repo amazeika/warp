@@ -567,6 +567,7 @@ fn parse_dcs_ssh() {
                 session_id: Some(167303092612201),
                 remote_session_id: Some(167303092612202),
                 external_control_master: false,
+                persist: false,
             }
         ),
         _ => panic!("incorrect dcs value"),
@@ -599,6 +600,44 @@ fn parse_dcs_ssh_with_external_control_master() {
                 session_id: Some(167303092612201),
                 remote_session_id: Some(167303092612202),
                 external_control_master: true,
+                persist: false,
+            }
+        ),
+        _ => panic!("incorrect dcs value"),
+    };
+}
+
+/// The wrapper reports `persist` when it created the master with
+/// `ControlPersist`. Teardown keys the forced `ssh -O exit` off this, so the
+/// field has to survive parsing rather than silently defaulting to false.
+#[test]
+fn parse_dcs_ssh_with_persistent_control_master() {
+    let bytes = hex_encoded_dcs_string(
+        r#"{
+                "hook": "SSH",
+                "value": {
+                    "socket_path": "~/.ssh/9001",
+                    "remote_shell": "zsh",
+                    "session_id": 167303092612201,
+                    "remote_session_id": 167303092612202,
+                    "external_control_master": false,
+                    "persist": true
+                }
+            }"#,
+    );
+    let (_, handler) = parse_bytes(&bytes);
+
+    assert_eq!(handler.d_proto_hooks.len(), 1);
+    match handler.d_proto_hooks.first().unwrap() {
+        DProtoHook::SSH { value } => assert_eq!(
+            *value,
+            SSHValue {
+                socket_path: PathBuf::from("~/.ssh/9001"),
+                remote_shell: "zsh".to_string(),
+                session_id: Some(167303092612201),
+                remote_session_id: Some(167303092612202),
+                external_control_master: false,
+                persist: true,
             }
         ),
         _ => panic!("incorrect dcs value"),

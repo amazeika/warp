@@ -10215,3 +10215,484 @@ fn back_button_label_resolves_token_only_parent_linkage() {
         });
     });
 }
+/// The outcome of a split cloned onto its source pane's SSH connection (GH5409).
+///
+/// An attempt must never resolve into more than one outcome, or the rollout data the feature flag
+/// is judged on is wrong. The lifetime under test is "the one attach attempt this split was made
+/// for", and what ends it is the subject of the regression below.
+mod ssh_clone_split_attach_outcome {
+    use warp_terminal::event::ExitReason;
+    use warp_terminal::model::session::get_local_hostname;
+
+    use super::*;
+
+    const SSH_COMMAND: &str = "ssh -J bastion mini";
+
+    /// Drives a session bootstrap in `terminal`. A hostname unlike the local one is what makes
+    /// the resulting session `WarpifiedRemote`, exactly as a real `ssh` does.
+    pub(super) fn bootstrap_session(
+        terminal: &ViewHandle<TerminalView>,
+        app: &mut App,
+        hostname: &str,
+    ) {
+        terminal.update(app, |view, _ctx| {
+            let mut model = view.model.lock();
+            model.init_shell(InitShellValue {
+                session_id: 0.into(),
+                shell: "bash".to_owned(),
+                hostname: hostname.to_owned(),
+                ..Default::default()
+            });
+            model.bootstrapped(BootstrappedValue {
+                shell: "bash".to_owned(),
+                ..Default::default()
+            });
+        });
+    }
+
+    fn bootstrap_remote(terminal: &ViewHandle<TerminalView>, app: &mut App) {
+        bootstrap_session(terminal, app, "build-host");
+    }
+
+    pub(super) fn bootstrap_local(terminal: &ViewHandle<TerminalView>, app: &mut App) {
+        let hostname = get_local_hostname().expect("the test host has a hostname");
+        bootstrap_session(terminal, app, &hostname);
+    }
+
+    fn arm(terminal: &ViewHandle<TerminalView>, app: &mut App) {
+        terminal.update(app, |view, _ctx| view.set_pending_ssh_clone());
+    }
+
+    /// A user command starting in the pane. The clone submits one (its replayed `ssh`); a second
+    /// can only start once the pane is back at a local prompt.
+    fn start_command(terminal: &ViewHandle<TerminalView>, app: &mut App, command: &str) {
+        terminal.update(app, |view, ctx| {
+            view.handle_terminal_event(
+                &ModelEvent::AfterBlockStarted {
+                    block_id: BlockId::new(),
+                    command: command.to_owned(),
+                    is_for_in_band_command: false,
+                },
+                ctx,
+            );
+        });
+    }
+
+    /// The replayed `ssh` completing as an ordinary user block. Warpification replaces that block,
+    /// so this is what *success* looks like, not failure.
+    fn end_ssh_block(terminal: &ViewHandle<TerminalView>, app: &mut App) {
+        terminal.update(app, |view, ctx| {
+            let block_id = view.model.lock().block_list().active_block_id().clone();
+            view.on_user_block_completed(&block_id, ctx);
+        });
+    }
+
+    /// Whether the pane is still waiting to find out how its attach attempt ended. Its clearing is
+    /// what emits the outcome telemetry, so these tests pin that transition rather than the send.
+    fn awaiting_ssh_clone(terminal: &ViewHandle<TerminalView>, app: &App) -> bool {
+        terminal.read(app, |view, _ctx| view.awaiting_ssh_clone)
+    }
+
+    /// The regression that made this feature's telemetry useless: the replayed `ssh` block
+    /// completes at warpification, a beat before `handle_session_bootstrapped` runs. Resolving the
+    /// attempt there reported every success as a fallback, and never reported one as a success.
+    #[test]
+    fn does_not_resolve_the_attach_attempt_when_the_replayed_ssh_block_completes() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+            arm(&terminal, &mut app);
+
+            start_command(&terminal, &mut app, SSH_COMMAND);
+            end_ssh_block(&terminal, &mut app);
+
+            assert!(
+                awaiting_ssh_clone(&terminal, &app),
+                "warpification replaces the ssh block, so its completion is not a failure"
+            );
+        })
+    }
+
+    /// The success path: the attach warpified, which is the first moment anything in the app knows
+    /// it worked.
+    #[test]
+    fn resolves_the_attach_attempt_when_the_replayed_ssh_warpifies() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+            arm(&terminal, &mut app);
+
+            start_command(&terminal, &mut app, SSH_COMMAND);
+            end_ssh_block(&terminal, &mut app);
+            bootstrap_remote(&terminal, &mut app);
+
+            assert_eventually!(
+                !awaiting_ssh_clone(&terminal, &app),
+                "a warpified remote session is the attach succeeding"
+            );
+        })
+    }
+
+    /// The fallback: the replayed `ssh` finished without warpifying, the pane is back at a local
+    /// prompt, and the user runs something else.
+    #[test]
+    fn resolves_the_attach_attempt_when_a_second_command_starts() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+            arm(&terminal, &mut app);
+
+            start_command(&terminal, &mut app, SSH_COMMAND);
+            end_ssh_block(&terminal, &mut app);
+            start_command(&terminal, &mut app, "ls");
+
+            assert!(!awaiting_ssh_clone(&terminal, &app));
+        })
+    }
+
+    /// A cloned pane's own local shell bootstraps before its `ssh` does. That is not the outcome
+    /// the attempt is waiting for.
+    #[test]
+    fn does_not_resolve_the_attach_attempt_on_the_local_bootstrap() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+            arm(&terminal, &mut app);
+
+            bootstrap_local(&terminal, &mut app);
+
+            assert_eventually!(
+                terminal.read(&app, |view, _ctx| view.is_login_shell_bootstrapped),
+                "The local session never bootstrapped"
+            );
+            assert!(
+                awaiting_ssh_clone(&terminal, &app),
+                "the local bootstrap is not the outcome the attempt is waiting for"
+            );
+        })
+    }
+
+    /// The backstop: the pane's local shell exited, so nothing of this attempt can still resolve.
+    #[test]
+    fn resolves_the_attach_attempt_when_the_pane_shell_exits() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+            arm(&terminal, &mut app);
+            bootstrap_local(&terminal, &mut app);
+            assert_eventually!(
+                terminal.read(&app, |view, _ctx| view.is_login_shell_bootstrapped),
+                "The local session never bootstrapped"
+            );
+
+            terminal.update(&mut app, |view, ctx| {
+                view.handle_terminal_event(
+                    &ModelEvent::Exit {
+                        reason: ExitReason::ShellProcessExited,
+                    },
+                    ctx,
+                );
+            });
+
+            assert!(
+                !awaiting_ssh_clone(&terminal, &app),
+                "a shell that exited cannot still be attaching"
+            );
+        })
+    }
+}
+
+/// An in-band command's precmd must not erase the directory the pane is in.
+///
+/// The shell reports `"pwd": ""` for an in-band command, which `empty_string_is_none` turns into
+/// `None`. Warp fires these while the user types, so a reader that asks the active block where it
+/// is sees the erased state far more often than the real one.
+mod in_band_metadata_keeps_the_working_directory {
+    use super::*;
+
+    fn apply(
+        terminal: &ViewHandle<TerminalView>,
+        app: &mut App,
+        cwd: Option<&str>,
+        is_after_in_band_command: bool,
+    ) {
+        terminal.update(app, |view, ctx| {
+            view.apply_block_metadata_update(
+                &BlockMetadata::new(None, cwd.map(str::to_owned)),
+                is_after_in_band_command,
+                false, // is_done_bootstrapping
+                BlockMetadataUpdateSource::Precmd,
+                ctx,
+            );
+        });
+    }
+
+    fn pwd(terminal: &ViewHandle<TerminalView>, app: &App) -> Option<String> {
+        terminal.read(app, |view, _ctx| view.pwd())
+    }
+
+    #[test]
+    fn an_in_band_precmd_does_not_clear_a_known_directory() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+
+            apply(&terminal, &mut app, Some("/srv/app"), false);
+            apply(&terminal, &mut app, None, true);
+
+            assert_eq!(
+                pwd(&terminal, &app).as_deref(),
+                Some("/srv/app"),
+                "an in-band command does not change the CWD, so the known one has to survive it",
+            );
+        })
+    }
+
+    /// The carry-forward is a floor, not a freeze: an in-band update that does name a directory
+    /// still wins, so nothing here can pin a pane to a stale one.
+    #[test]
+    fn an_in_band_precmd_that_names_a_directory_still_applies_it() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+
+            apply(&terminal, &mut app, Some("/srv/app"), false);
+            apply(&terminal, &mut app, Some("/var/log"), true);
+
+            assert_eq!(pwd(&terminal, &app).as_deref(), Some("/var/log"));
+        })
+    }
+
+    /// An ordinary precmd is untouched: it may still clear the directory, which is what a session
+    /// reporting none actually means.
+    #[test]
+    fn an_ordinary_precmd_may_still_clear_the_directory() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+
+            apply(&terminal, &mut app, Some("/srv/app"), false);
+            apply(&terminal, &mut app, None, false);
+
+            assert_eq!(pwd(&terminal, &app), None);
+        })
+    }
+}
+
+/// Releasing the remote-server clients that hold a pane's `ControlMaster`s open.
+///
+/// The master itself is never stopped here — a persistent one exists so a split can still be
+/// attached to it. What these pin is that Warp stops being a *client* of it, because until every
+/// client is gone `ControlPersist`'s idle timeout never starts counting.
+mod ssh_wrapper_session_release {
+    use remote_server::manager::RemoteServerManager;
+    use warp_terminal::event::ExitReason;
+
+    use super::ssh_clone_split_attach_outcome::bootstrap_local;
+    use super::*;
+    use crate::pane_group::pane::DetachType;
+    use crate::terminal::model::session::SessionInfo;
+    use crate::terminal::view::detach_releases_ssh_sessions;
+
+    fn wrapper_session_info(id: u64) -> SessionInfo {
+        SessionInfo::new_for_test()
+            .with_id(id)
+            .with_ssh_socket_path("/tmp/warp-ssh-socket".into())
+    }
+
+    fn recorded_sessions(terminal: &ViewHandle<TerminalView>, app: &App) -> Vec<SessionId> {
+        terminal.read(app, |view, _ctx| {
+            view.ssh_wrapper_sessions.iter().copied().collect()
+        })
+    }
+
+    /// The manager starts tracking a session before its handshake completes, so a pane closed
+    /// mid-connect still has a proxy child to release. Recording at bootstrap-success binding
+    /// instead would miss exactly that pane.
+    #[test]
+    fn records_a_wrapper_session_when_it_starts() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+
+            terminal.update(&mut app, |view, ctx| {
+                view.handle_terminal_event(
+                    &ModelEvent::SshInitShell {
+                        pending_session_info: Box::new(wrapper_session_info(7)),
+                    },
+                    ctx,
+                );
+            });
+
+            assert_eq!(
+                recorded_sessions(&terminal, &app),
+                vec![SessionId::from(7)],
+                "the session is recorded from the init-shell payload, before any connection exists"
+            );
+        })
+    }
+
+    #[test]
+    fn does_not_record_a_session_without_a_wrapper_socket() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+
+            terminal.update(&mut app, |view, ctx| {
+                view.handle_terminal_event(
+                    &ModelEvent::SshInitShell {
+                        pending_session_info: Box::new(SessionInfo::new_for_test().with_id(7)),
+                    },
+                    ctx,
+                );
+            });
+
+            assert!(
+                recorded_sessions(&terminal, &app).is_empty(),
+                "a session with no wrapper socket has no ControlMaster for this pane to release"
+            );
+        })
+    }
+
+    /// A pane can hold several nested SSH sessions, and every one of them has its own proxy child.
+    #[test]
+    fn releases_every_session_the_pane_started() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let manager = app.add_singleton_model(RemoteServerManager::new);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+            let connecting = SessionId::from(1);
+            let disconnected = SessionId::from(2);
+
+            manager.update(&mut app, |manager, _ctx| {
+                // Still mid-handshake.
+                manager.seed_connecting_session_for_test(connecting);
+                // Already out of `sessions`, but the side maps `mark_session_disconnected` leaves
+                // behind still name it.
+                manager.seed_session_label_for_test(disconnected);
+            });
+            terminal.update(&mut app, |view, ctx| {
+                view.ssh_wrapper_sessions.insert(connecting);
+                view.ssh_wrapper_sessions.insert(disconnected);
+                view.release_ssh_wrapper_sessions(ctx);
+            });
+
+            manager.read(&app, |manager, _ctx| {
+                assert!(
+                    !manager.tracks_session(connecting),
+                    "a session still connecting when its pane went away must still be released"
+                );
+                assert!(
+                    !manager.tracks_session(disconnected),
+                    "every session the pane started is released, not only the live ones"
+                );
+            });
+            assert!(
+                recorded_sessions(&terminal, &app).is_empty(),
+                "a released session is no longer this pane's to release"
+            );
+        })
+    }
+
+    /// `ExitShell` is a remote hook that an abruptly killed shell never sends, so the local shell
+    /// exiting is what releases a pane that stays open.
+    #[test]
+    fn a_local_shell_exit_releases_the_panes_sessions() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let manager = app.add_singleton_model(RemoteServerManager::new);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+            let session_id = SessionId::from(1);
+
+            // The `Exit` arm reads models that only exist once the pane's own shell has come up.
+            bootstrap_local(&terminal, &mut app);
+            assert_eventually!(
+                terminal.read(&app, |view, _ctx| view.is_login_shell_bootstrapped),
+                "The local session never bootstrapped"
+            );
+            manager.update(&mut app, |manager, _ctx| {
+                manager.seed_connecting_session_for_test(session_id);
+            });
+            terminal.update(&mut app, |view, ctx| {
+                view.ssh_wrapper_sessions.insert(session_id);
+                view.handle_terminal_event(
+                    &ModelEvent::Exit {
+                        reason: ExitReason::ShellProcessExited,
+                    },
+                    ctx,
+                );
+            });
+
+            manager.read(&app, |manager, _ctx| {
+                assert!(
+                    !manager.tracks_session(session_id),
+                    "a shell that exits while its pane stays open must still release its session"
+                );
+            });
+        })
+    }
+
+    #[test]
+    fn only_a_permanent_close_releases_the_panes_sessions() {
+        assert!(
+            detach_releases_ssh_sessions(DetachType::Closed),
+            "a permanently closed pane must release, or its ControlMaster never goes idle"
+        );
+        assert!(
+            !detach_releases_ssh_sessions(DetachType::HiddenForClose),
+            "a tab hidden for close is restorable and comes back to the same connection"
+        );
+        assert!(
+            !detach_releases_ssh_sessions(DetachType::Moved),
+            "a moved pane keeps its connection"
+        );
+    }
+
+    /// A window close snapshots this set rather than draining it, and that difference is
+    /// load-bearing: an undone close brings these panes back, and nothing re-arms a set that was
+    /// taken away — `record_ssh_wrapper_session` runs only when a session starts. A drained pane
+    /// would be unable to release itself for the rest of its life.
+    #[test]
+    fn snapshotting_leaves_the_pane_able_to_release_later() {
+        App::test((), |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal =
+                MockTerminalManager::create_new_terminal_view_window_for_test(&mut app, None);
+
+            terminal.update(&mut app, |view, ctx| {
+                view.handle_terminal_event(
+                    &ModelEvent::SshInitShell {
+                        pending_session_info: Box::new(wrapper_session_info(7)),
+                    },
+                    ctx,
+                );
+            });
+
+            let first = terminal.read(&app, |view, _ctx| view.ssh_wrapper_session_snapshot());
+            let second = terminal.read(&app, |view, _ctx| view.ssh_wrapper_session_snapshot());
+
+            assert_eq!(first, vec![SessionId::from(7)]);
+            assert_eq!(
+                second, first,
+                "a snapshot must not consume what it reports, or a second caller sees nothing"
+            );
+            assert_eq!(
+                recorded_sessions(&terminal, &app),
+                vec![SessionId::from(7)],
+                "the pane keeps its sessions, so its own later close still releases them"
+            );
+        })
+    }
+}
