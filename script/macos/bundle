@@ -215,6 +215,9 @@ DMG_NAME_SUFFIX=""
 # By default we build dev bundles.
 RELEASE_CHANNEL="dev"
 FEATURES="release_bundle,cocoa_sentry,extern_plist"
+# Features requested with --features, kept separately so the per-channel block below
+# can rebuild FEATURES without silently dropping them.
+EXTRA_FEATURES=""
 REGISTER_SERVICES=true
 DEBUG=false
 ARTIFACT="app"
@@ -330,6 +333,7 @@ while (( "$#" )); do
       if [ -n "$2" ] && [ "${2:0:1}" != "-" ]; then
         echo "Adding Cargo features: $2"
         FEATURES="$FEATURES,$2"
+        EXTRA_FEATURES="$EXTRA_FEATURES,$2"
         shift 2
       else
         echo "Error: Argument for $1 is missing" >&2
@@ -435,6 +439,12 @@ elif [[ $RELEASE_CHANNEL = "oss" ]]; then
     # The OSS channel does not ship Sentry, so drop the cocoa_sentry feature
     # (which would otherwise pull in the Sentry framework dependency).
     FEATURES="release_bundle,extern_plist"
+fi
+
+# The oss branch above rebuilds FEATURES from scratch, so anything given with
+# --features has to be re-applied here or it is silently dropped.
+if [ -n "$EXTRA_FEATURES" ]; then
+    FEATURES="$FEATURES$EXTRA_FEATURES"
 fi
 
 OUT_DIR="target/$TARGET_PROFILE_DIR/bundle/osx"
