@@ -5087,12 +5087,15 @@ mod ssh_session_release_on_tab_close {
         tracked.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// A tab removed without an undo entry is not necessarily closed — a tab dragged to another
+    /// window is removed exactly that way, and its panes carry on there. Detaching them as
+    /// `Closed` would clear their AI conversations and delete their blocks, so the detach stays
+    /// reversible and the sessions stay with the panes.
     #[test]
-    fn a_tab_closed_without_an_undo_entry_releases_its_sessions() {
+    fn a_tab_removed_without_an_undo_entry_keeps_its_sessions() {
         assert!(
-            !still_tracked_after_tab_close(false),
-            "the tab is dropped outright, so nothing later reaches its panes: without releasing \
-             here the proxy child keeps its ControlMaster alive for the rest of the process"
+            still_tracked_after_tab_close(false),
+            "a tab removed without an undo entry may have been moved, not closed"
         );
     }
 

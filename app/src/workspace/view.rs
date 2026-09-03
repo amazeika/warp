@@ -12122,17 +12122,23 @@ impl Workspace {
                     ctx,
                 );
 
-                // A tab that is not stored on the undo stack can never be restored, and nothing
-                // later walks its panes: `clean_up_panes` — the only other source of a `Closed`
-                // detach for a whole tab — runs solely when an undo entry expires. So this is the
-                // last chance to release per-pane resources that outlive the view, such as an SSH
-                // session's remote-server client holding its ControlMaster open.
-                let detach_type = if add_to_undo_stack {
-                    DetachType::HiddenForClose
-                } else {
-                    DetachType::Closed
-                };
-                pane_group.detach_panes_for_close(detach_type, &working_directories_model, ctx);
+                // Always reversible, whatever the undo stack holds. `add_to_undo_stack` says
+                // whether the tab can be *restored*, not whether its panes are gone: a tab moved
+                // to another window is removed without an undo entry and its panes carry on
+                // there. Detaching those as `Closed` would clear their AI conversations and
+                // delete their blocks, so a drag between windows would destroy real history.
+                //
+                // The cost is that a tab closed without an undo entry — a rare path, not an
+                // ordinary close — never releases its SSH sessions, so the remote-server proxy
+                // keeps that `ControlMaster` from going idle. A leak in a rare path is the better
+                // trade until the callers pass a real moved-or-closed signal; the ordinary close
+                // is unaffected, since its undo entry expiring runs `clean_up_panes`, which
+                // detaches as `Closed`.
+                pane_group.detach_panes_for_close(
+                    DetachType::HiddenForClose,
+                    &working_directories_model,
+                    ctx,
+                );
             });
         }
 
