@@ -10217,9 +10217,9 @@ fn back_button_label_resolves_token_only_parent_linkage() {
 }
 /// The outcome of a split cloned onto its source pane's SSH connection (GH5409).
 ///
-/// Each `Requested` has to resolve into exactly one terminal event, or the rollout data the
-/// feature flag is judged on is wrong. The lifetime under test is "the one attach attempt this
-/// split was made for", and what ends it is the subject of the regression below.
+/// An attempt must never resolve into more than one outcome, or the rollout data the feature flag
+/// is judged on is wrong. The lifetime under test is "the one attach attempt this split was made
+/// for", and what ends it is the subject of the regression below.
 mod ssh_clone_split_attach_outcome {
     use warp_terminal::event::ExitReason;
     use warp_terminal::model::session::get_local_hostname;

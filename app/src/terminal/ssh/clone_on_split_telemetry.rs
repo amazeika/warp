@@ -25,9 +25,9 @@ pub enum SshCloneOnSplitTelemetryEvent {
     /// handed the pane back at a local prompt.
     FellBackToLocal,
     /// The pane's shell exited while the attach attempt was still outstanding, so it neither
-    /// cloned nor fell back. Reported rather than dropped so `Requested` always resolves into
-    /// exactly one outcome and a success rate cannot be read as low merely because users close
-    /// panes while connecting.
+    /// cloned nor fell back. Reported rather than dropped so a success rate is not read as low
+    /// merely because users close panes while connecting. It does not cover every such close:
+    /// closing a pane outright delivers no `Exit`, and that attempt reports nothing.
     Abandoned,
 }
 

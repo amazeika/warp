@@ -2749,8 +2749,8 @@ pub struct TerminalView {
     /// out whether that worked.
     ///
     /// Its lifetime is the one attach attempt the split was made for: it is set when the split is
-    /// made and taken by whichever outcome arrives first, which is what makes each `Requested`
-    /// resolve into exactly one terminal event.
+    /// made and taken by whichever outcome arrives first, so an attempt is never reported twice.
+    /// It can go unreported, though — a pane closed outright delivers no `Exit`.
     awaiting_ssh_clone: bool,
     /// Whether the replayed `ssh` of a pending clone has started running.
     ///
@@ -11923,11 +11923,14 @@ impl TerminalView {
                 // abruptly killed shell never sends. A closed pane does not reach here — see
                 // `release_ssh_wrapper_sessions`.
                 self.release_ssh_wrapper_sessions(ctx);
-                // Nothing in this pane will bootstrap now, and the shell that would have run the
-                // `cd` is gone. This is neither a clone nor a fallback, so it gets its own
-                // outcome: reporting it keeps `Requested` resolving into exactly one terminal
-                // event, which is what stops ordinary pane closes from reading as a depressed
-                // success rate.
+                // Nothing in this pane will bootstrap now, so an attach still outstanding is
+                // over. Neither a clone nor a fallback, so it gets its own outcome, which keeps
+                // an abandoned attempt from reading as a depressed success rate.
+                //
+                // This does not make every `Requested` resolve. `Exit` is not delivered when a
+                // pane is closed outright — see `release_ssh_wrapper_sessions` — so an attach
+                // that failed and was then closed reports nothing at all. A dashboard has to read
+                // the outcomes as a floor on what happened, not as a partition of `Requested`.
                 if std::mem::take(&mut self.awaiting_ssh_clone) {
                     send_telemetry_from_ctx!(SshCloneOnSplitTelemetryEvent::Abandoned, ctx);
                 }

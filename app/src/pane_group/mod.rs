@@ -6917,14 +6917,14 @@ impl PaneGroup {
             view.update(ctx, |terminal_view, ctx| {
                 terminal_view.set_pending_command_queue(vec![request.command], ctx);
                 terminal_view.set_pending_ssh_clone();
-                // Entering agent view now would put a conversation over a pane that is still
-                // submitting `ssh`, so the user would be talking to an agent on their laptop while
-                // the pane authenticates to a remote host. Defer it the way the tab-config path
-                // defers setup commands. Note the deferral only fires once the `ssh` block
-                // completes, which for an interactive session means at logout.
-                if should_immediately_enter_agent_view {
-                    terminal_view.set_enter_agent_view_after_pending_commands();
-                }
+                // A cloned split stays a terminal pane, even for a user whose default session
+                // mode is Agent. Entering agent view immediately would put a conversation over a
+                // pane that is still submitting `ssh`, so the user would be talking to an agent
+                // on their laptop while the pane authenticates to a remote host. Deferring it
+                // until the replayed `ssh` block completes is no better: warpification *replaces*
+                // that block, so when the deferral fires — and whether it fires at all — depends
+                // on how the attach resolves. Doing nothing is the one predictable option; the
+                // user can enter agent view themselves once the pane is connected.
             });
         }
 
