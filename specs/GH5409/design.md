@@ -3,7 +3,7 @@ status: shipped
 issue: 5409
 tracking: amazeika/warp#1
 pr: null
-completed: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+completed: [1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13]  # 5 withdrawn
 ---
 
 # Reuse the SSH connection when splitting a pane — Design Document
@@ -53,8 +53,10 @@ is the load-bearing proof for this design: a client attaching to a live master n
 ### Goal
 
 Splitting a pane whose active session is a warpified SSH session established by the Warp SSH
-wrapper opens a new pane on the *same* SSH connection, in the same remote directory, with no
-authentication prompt.
+wrapper opens a new pane on the *same* SSH connection, with no authentication prompt.
+
+The new pane lands in the remote default directory, as a fresh `ssh` would. Landing it in the
+source pane's directory was Phase 5, withdrawn before the PR — see that phase and the Outcome.
 
 Non-goals:
 
@@ -82,7 +84,6 @@ Non-goals:
 ```
 source pane (warpified SSH session)
   session.is_ssh_wrapper_session -> Yes { socket_path, external_control_master }
-  active block metadata          -> remote cwd (raw string)
   bound warpify record           -> original ssh command
                      |
                      v  split
@@ -95,7 +96,7 @@ new pane
       -o ProxyCommand=false -o ProxyJump=none -t <dest> <bootstrap>
                      |
                      v  bootstrap completes, session becomes WarpifiedRemote
-  submit  cd '<remote cwd>'
+  (Phase 5 submitted `cd '<remote cwd>'` here; withdrawn — the pane keeps the remote default)
 ```
 
 ### Why the command is replayed verbatim
@@ -321,7 +322,13 @@ it only when it matches `active_block_session_id()`. The binding is made only fo
 warpification ([view.rs:9922-9924](../../app/src/terminal/view.rs#L9922-L9924)), and is cleared
 alongside `pending_state` on session completion.
 
-### Delivering the remote `cd`
+### Delivering the remote `cd` — WITHDRAWN
+
+The analysis below is retained because it is the map for the follow-up, and because the ordering it
+gets wrong is the defect the Outcome records. Its conclusion — that the `ssh` block completing
+means the attach failed — is false: warpification replaces that block, so it completes on the
+success path too.
+
 
 The remote cwd comes from the active block's metadata
 ([block.rs:667-669](../../app/src/terminal/model/block.rs#L667-L669)) as a raw string — no
@@ -663,7 +670,22 @@ dead-master path) and a second declared test gate over `session_tests.rs`.
 3. Pass `WARP_SSH_ATTACH_CONTROL_PATH` through `create_terminal_pane_data`, and the command through
    `set_pending_command_queue`.
 
-### Phase 5: Land the split pane in the source pane's remote directory
+### Phase 5: Land the split pane in the source pane's remote directory — WITHDRAWN
+
+**Withdrawn before the PR.** It never worked: the attach state it depended on was destroyed
+before the remote session could consume it (see the Outcome), so no split ever entered its source
+pane's directory. Rather than repair machinery the tracking issue never asked for, the delivery
+was removed and the PR scoped to what
+[warpdotdev/warp#5409](https://github.com/warpdotdev/warp/issues/5409) does ask for: reusing the
+connection. Splitting into the same directory remains a clean follow-up, and the failure analysed
+below is the map for doing it correctly.
+
+What was kept from this phase: the Fish quoting fix in `warp_terminal`, which has 30 callers and
+was a pre-existing bug unrelated to SSH. What was removed: `submittable_remote_cwd`, `remote_cwd`
+on `SshCloneFacts`/`SshCloneRequest`, `pending_remote_cwd`, `enter_remote_cwd`, and their tests.
+
+The criteria below are recorded as they stood when the phase was believed complete. They are not
+met by the shipped code, and their tests no longer exist.
 
 **ID:** `5`
 **Goal:** the new pane's remote shell starts in the same remote directory as the source pane
@@ -1295,15 +1317,16 @@ credentials for it, so presubmit is not runnable outside Warp's own environment.
 ## Outcome
 
 Splitting a pane that holds a warpified SSH session established by the Warp wrapper now opens the
-new pane on that same connection, in the same remote directory, with no authentication prompt. It
-ships off: both the `CloneSshOnSplit` flag and the `clone_ssh_on_split` setting default to off.
+new pane on that same connection, with no authentication prompt. The new pane starts in the remote
+default directory; Phase 5 would have landed it in the source pane's directory and was withdrawn
+before the PR. It ships off: both the `CloneSshOnSplit` flag and the `clone_ssh_on_split` setting
+default to off.
 
 The path, end to end: the bundled wrappers attach to a supplied master rather than create one when
 `WARP_SSH_ATTACH_CONTROL_PATH` names a live socket (Phase 1); Warp-owned masters carry
 `ControlPersist=60`, so the connection outlives the foreground `ssh` that created it (Phase 2); each
 warpified session remembers the `ssh` command that created it (Phase 3); `split_terminal_pane` turns
-that into a clone request for the pane being split (Phase 4), whose new pane `cd`s to the source
-pane's remote directory (Phase 5). The request is gated on warpification, the flag, the setting, and
+that into a clone request for the pane being split (Phase 4). The request is gated on warpification, the flag, the setting, and
 the source master outliving the source pane (Phases 4 and 6), and every decline falls back to
 today's local pane.
 
@@ -1338,8 +1361,44 @@ specific message for `sshd` `MaxSessions` exhaustion, if the generic failure pro
 Phase 12 tree — 18 gates, 552 tests, no failures and no remediation. Phases 7 and 11 were likewise
 green at their own trees.
 
-**Still outstanding:** none of Section 4 has been run. That verification needs a key-based and a
-password-only host — and, for the Windows/WSL rows, hardware — that this work was not developed on,
+**Manual verification (2026-09-03), and what it changed.** The feature was exercised end to end
+for the first time, from an OSS-channel build carrying `--features clone_ssh_on_split`, against a
+host on the local network. Splitting a warpified SSH pane opens the new pane on the same
+connection with no second authentication prompt — the design's central claim holds, in a plain
+terminal pane and in one with an agent block active.
+
+It also found that **Phase 5 had never worked, and that its failure corrupted this feature's
+telemetry.** Both trace to one ordering error. `on_user_block_completed` treated the replayed
+`ssh` block completing as proof the attach had failed, reasoning that on the success path that
+block "stays open until logout". It does not: warpification *replaces* it, so on every successful
+attach that block completed a beat before `handle_session_bootstrapped` ran. The consequences:
+
+- the pending remote directory was discarded before the remote session could enter it, so a split
+  always landed in the remote home; and
+- `FellBackToLocal` was reported for every success and `Succeeded` never at all — so the rollout
+  data this feature flag would be judged on said the feature never works.
+
+The first is moot: Phase 5 is withdrawn. The second is fixed. The attach attempt now resolves when
+a *second* user command starts in the pane, which can only happen once the pane is back at a local
+prompt. The clone submits exactly one command, so its block starting is expected; anything after
+it is the genuine end of the attempt.
+
+**Why the suite missed it.** Phase 5's tests drove `on_user_block_completed` directly and asserted
+the mechanism — that a completing block resolves the attempt — rather than the behaviour. The
+sequence in between, where the inversion lives, went untested: both ends of the seam were covered
+and the seam was not.
+
+**Also fixed, unrelated to SSH.** An in-band command's precmd reports `"pwd": ""`, which
+`empty_string_is_none` turns into `None`, and `apply_block_metadata_update` stored it over the
+known directory — erasing exactly what its own comment says an in-band command must not touch.
+Warp fires in-band commands while the user types, so any reader of the active block's cwd could
+observe the erased state. It now carries the previous directory forward, with tests.
+
+**Sweep after the changes:** 374 tests across `terminal::view`, `terminal::ssh`, `pane_group`,
+`workspace::view`, `undo_close::stack` and `settings::ssh`, all passing.
+
+**Still outstanding:** the rest of Section 4 has not been run. The manual pass above used a
+key-based host on a trusted network. Full verification still needs a password-only host — and, for the Windows/WSL rows, hardware — that this work was not developed on,
 and it is the only evidence that the no-second-prompt claim holds against a real server rather than
 against the wrapper's fail-closed paths. `./script/presubmit` and the narrated screen recording for
 the upstream PR are outstanding for the same reason: presubmit's integration tests tunnel to Warp's

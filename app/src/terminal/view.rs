@@ -452,7 +452,7 @@ use crate::terminal::model::selection::{SelectAction, SelectionDirection};
 use crate::terminal::model::session::active_session::ActiveSession;
 use crate::terminal::model::session::{
     BootstrapSessionType, IsSSHWrapperSession, Session, SessionId, SessionInfo, SessionType,
-    Sessions, SessionsEvent, shell_quote_arg,
+    Sessions, SessionsEvent,
 };
 use crate::terminal::model::terminal_model::{
     BlockIndex, BlockSelectionCardinality, SelectedBlocks, TerminalInputState, WithinModel,
@@ -2743,26 +2743,20 @@ pub struct TerminalView {
     onboarding_callout_view: Option<ViewHandle<onboarding::OnboardingCalloutView>>,
 
     /// The type of the subshell that we will bootstrap/"warpify"" on the next [`AfterBlockStarted`]
-    /// terminal model event. Will only be `Some` with a [`ShellType`] we can bootstrap.
+    /// event.
     pending_auto_bootstrap_shell_type: Option<ShellType>,
-
-    /// The remote directory of the pane this one was split from, waiting for this pane's own
-    /// remote session to bootstrap so the `cd` can be quoted for the shell that reports itself.
-    ///
-    /// It cannot travel with the `ssh` command in `pending_command_queue`: that queue advances
-    /// only when the previous command's block completes, and an interactive `ssh` block does not
-    /// complete until logout — the `cd` would run on the laptop after the user disconnected.
-    ///
-    /// Its lifetime is the one attach attempt the split was made for. Anything that ends that
-    /// attempt drops it, because a directory named by one host must never be entered on another.
-    pending_remote_cwd: Option<String>,
     /// Whether this pane was opened to join another pane's SSH connection and has not yet found
     /// out whether that worked.
     ///
-    /// Separate from `pending_remote_cwd`, which is legitimately `None` for a clone whose source
-    /// reported no directory — only this says an attach is outstanding. Shares that field's
-    /// lifetime exactly: the one attach attempt the split was made for.
+    /// Its lifetime is the one attach attempt the split was made for: it is set when the split is
+    /// made and taken by whichever outcome arrives first, which is what makes each `Requested`
+    /// resolve into exactly one terminal event.
     awaiting_ssh_clone: bool,
+    /// Whether the replayed `ssh` of a pending clone has started running.
+    ///
+    /// The clone submits exactly one command, so its block starting is not news. A *second*
+    /// command starting is: it can only happen once the pane is back at a local prompt.
+    ssh_clone_command_started: bool,
     /// Every SSH wrapper session this pane has started, recorded so the pane can release the
     /// remote-server clients holding their `ControlMaster`s open when it goes away.
     ///
@@ -4443,8 +4437,8 @@ impl TerminalView {
             settings_import_onboarding_block: None,
             onboarding_callout_view: None,
             pending_auto_bootstrap_shell_type: None,
-            pending_remote_cwd: None,
             awaiting_ssh_clone: false,
+            ssh_clone_command_started: false,
             ssh_wrapper_sessions: HashSet::new(),
             pending_env_var_collection: None,
             env_vars: Vec::new(),
@@ -9267,42 +9261,16 @@ impl TerminalView {
             wrapper: session.ssh_wrapper_session().clone(),
             bound_command: self.bound_ssh_command().map(str::to_owned),
             wsl_distro,
-            remote_cwd: self.pwd(),
         })
     }
 
-    /// Marks this pane as a clone of another's SSH connection, holding `remote_cwd` until its own
-    /// remote session bootstraps so the split lands in the directory its source pane was in.
-    pub fn set_pending_ssh_clone(&mut self, remote_cwd: Option<String>) {
-        self.pending_remote_cwd = remote_cwd;
+    /// Marks this pane as a clone of another pane's SSH connection, so the outcome of that attach
+    /// can be reported once it is known.
+    pub fn set_pending_ssh_clone(&mut self) {
         self.awaiting_ssh_clone = true;
+        self.ssh_clone_command_started = false;
     }
 
-    /// Submits the `cd` that lands a freshly bootstrapped remote session in `remote_cwd`.
-    ///
-    /// `shell` is the shell that session reported, and the quoting has to match it: the same
-    /// bytes that are one literal word to bash and zsh are two commands to fish, which honours
-    /// backslash escapes inside single quotes. Quoting for the pane's own shell would be wrong —
-    /// that is the local one, which only ran `ssh`.
-    ///
-    /// The input is emptied first. Submission goes through the ordinary pending-command path,
-    /// which inserts at the cursor rather than replacing, so anything already in the box would
-    /// otherwise be run as part of the same line.
-    fn enter_remote_cwd(
-        &mut self,
-        remote_cwd: &str,
-        shell: ShellType,
-        ctx: &mut ViewContext<Self>,
-    ) {
-        let command = format!("cd {}", shell_quote_arg(remote_cwd, shell));
-        self.input.update(ctx, |input, ctx| {
-            if !input.buffer_text(ctx).is_empty() {
-                log::info!("Replacing input to enter a split pane's remote directory");
-            }
-            input.replace_buffer_content("", ctx);
-        });
-        self.execute_command_or_set_pending(&command, ctx);
-    }
 
     /// Like `is_long_running`, but also requires the user to be in control of the command
     /// (i.e. the user ran it, or took it over from the agent). Returns `false` for commands
@@ -11274,17 +11242,6 @@ impl TerminalView {
     fn on_user_block_completed(&mut self, block_id: &BlockId, ctx: &mut ViewContext<Self>) {
         self.model.lock().end_notify_on_ssh_login_complete();
 
-        // A split pane runs exactly one user block before its remote session bootstraps: the
-        // replayed `ssh`. On the success path that block stays open until logout, by which time
-        // the directory has long been consumed — so reaching here with one still pending means
-        // the attach attempt ended without warpifying. The wrapper failed closed on a dead
-        // master, the host refused, or the user interrupted the login. The pane is back at its
-        // local prompt, and a directory named by the source host must not be left waiting there:
-        // the next `ssh` the user runs may reach an entirely different machine.
-        self.pending_remote_cwd = None;
-        if std::mem::take(&mut self.awaiting_ssh_clone) {
-            send_telemetry_from_ctx!(SshCloneOnSplitTelemetryEvent::FellBackToLocal, ctx);
-        }
 
         // If the block that just ended was an agent-requested long running command for which the user took over control,
         // and the user exited the command, we should resume the conversation.
@@ -11621,6 +11578,20 @@ impl TerminalView {
         // command. See also the complementary guard in
         // Input::set_active_block_metadata.
         if is_after_in_band_command {
+            // An in-band command's precmd reports `"pwd": ""`, which `empty_string_is_none`
+            // deserializes to `None`. Storing that verbatim would erase the CWD this branch exists
+            // to leave alone, so carry the previous one forward.
+            let block_metadata = &if block_metadata.current_working_directory().is_some() {
+                block_metadata.clone()
+            } else {
+                BlockMetadata::new(
+                    block_metadata.session_id(),
+                    self.active_block_metadata
+                        .as_ref()
+                        .and_then(BlockMetadata::current_working_directory)
+                        .map(str::to_owned),
+                )
+            };
             self.active_block_metadata = Some(block_metadata.clone());
             self.input.update(ctx, |view, ctx| {
                 view.set_active_block_metadata(
@@ -11959,7 +11930,6 @@ impl TerminalView {
                 // outcome: reporting it keeps `Requested` resolving into exactly one terminal
                 // event, which is what stops ordinary pane closes from reading as a depressed
                 // success rate.
-                self.pending_remote_cwd = None;
                 if std::mem::take(&mut self.awaiting_ssh_clone) {
                     send_telemetry_from_ctx!(SshCloneOnSplitTelemetryEvent::Abandoned, ctx);
                 }
@@ -12151,6 +12121,25 @@ impl TerminalView {
                 if *is_for_in_band_command {
                     return;
                 }
+
+                // The attach attempt ends here, not when the replayed `ssh` block completes.
+                // Warpification *replaces* that block, so on the success path it completes before
+                // `handle_session_bootstrapped` runs — resolving the attempt there reported every
+                // success as a fallback and never reported one as a success. The clone's own `ssh`
+                // is the first command to start and is expected; a second can only start once the
+                // pane is back at a local prompt, which is the real end of the attempt.
+                if self.awaiting_ssh_clone {
+                    if self.ssh_clone_command_started {
+                        self.awaiting_ssh_clone = false;
+                        send_telemetry_from_ctx!(
+                            SshCloneOnSplitTelemetryEvent::FellBackToLocal,
+                            ctx
+                        );
+                    } else {
+                        self.ssh_clone_command_started = true;
+                    }
+                }
+
                 self.did_notify_long_running = false;
 
                 // Snapshot the prompt state as of when the command began executing.
@@ -13949,10 +13938,6 @@ impl TerminalView {
             bootstrap_event.session_type,
             BootstrapSessionType::WarpifiedRemote
         );
-        // Read before `add_bootstrap_success_block` consumes the event. This is the shell that
-        // will parse anything submitted into this session, which is what a `cd` must be quoted
-        // for; the pane's own shell is the local one that merely ran `ssh`.
-        let bootstrapped_shell = bootstrap_event.shell.shell_type();
         if bootstrap_event.subshell_info.is_some() {
             self.add_bootstrap_success_block(bootstrap_event, ctx);
         }
@@ -13962,9 +13947,6 @@ impl TerminalView {
         // bootstrap would `cd` the laptop into a path that only exists on the remote host, and
         // would leave nothing for the session that needed it.
         if is_warpified_remote {
-            if let Some(remote_cwd) = self.pending_remote_cwd.take() {
-                self.enter_remote_cwd(&remote_cwd, bootstrapped_shell, ctx);
-            }
             // The wrapper only warpifies once it is through `ssh -O check` and attached, so this
             // is the first moment anything in the app knows the clone actually worked.
             if std::mem::take(&mut self.awaiting_ssh_clone) {

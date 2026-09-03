@@ -4,7 +4,6 @@ use super::*;
 
 const SOCKET: &str = "/tmp/warp-ssh/9f3c1e";
 const COMMAND: &str = "ssh -J bastion mini";
-const REMOTE_CWD: &str = "/srv/app";
 
 fn remote() -> SessionType {
     SessionType::WarpifiedRemote { host_id: None }
@@ -25,7 +24,6 @@ fn source(session_type: SessionType, wrapper: IsSSHWrapperSession) -> SshCloneFa
         wrapper,
         bound_command: Some(COMMAND.to_owned()),
         wsl_distro: None,
-        remote_cwd: Some(REMOTE_CWD.to_owned()),
     }
 }
 
@@ -171,44 +169,6 @@ fn attaches_when_neither_pane_is_wsl() {
 }
 
 /// The whole point of the phase: the new pane lands where the source pane was, not in the remote
-/// default. The path travels unquoted — only the session that bootstraps knows the shell that has
-/// to parse it.
-#[test]
-fn carries_the_source_pane_remote_directory() {
-    let request = clone_request(&source(remote(), warp_persistent_master()), None, true)
-        .expect("a persistent Warp master is attachable");
-
-    assert_eq!(request.remote_cwd.as_deref(), Some(REMOTE_CWD));
-}
-
-/// A pane whose active block reported no directory still splits — it simply lands in the remote
-/// default, which is where a fresh `ssh` would have put it.
-#[test]
-fn attaches_without_a_directory_when_the_remote_cwd_is_unknown() {
-    let source = SshCloneFacts {
-        remote_cwd: None,
-        ..source(remote(), warp_persistent_master())
-    };
-
-    let request = clone_request(&source, None, true).expect("an unknown directory is not a gate");
-
-    assert_eq!(request.remote_cwd, None);
-}
-
-/// The remote host chooses this string. A path that cannot be submitted as one line is refused
-/// here rather than carried to the pane, and the split still happens.
-#[test]
-fn attaches_without_a_directory_the_remote_host_cannot_name_safely() {
-    let source = SshCloneFacts {
-        remote_cwd: Some("/srv/app\nrm -rf /".to_owned()),
-        ..source(remote(), warp_persistent_master())
-    };
-
-    let request = clone_request(&source, None, true).expect("a refused directory is not a gate");
-
-    assert_eq!(request.remote_cwd, None);
-}
-
 /// The population the fallback rate is about: the user split a warpified SSH pane and got a local
 /// one. A pane the feature could never have served still counts — the user experienced the same
 /// thing — and stays separable by reason.

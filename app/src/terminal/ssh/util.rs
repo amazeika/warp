@@ -269,17 +269,6 @@ pub fn transfer_file_sftp_command(
     Some(command)
 }
 
-/// `remote_cwd` if a split pane may be sent into it, or `None` if it must not be submitted.
-///
-/// This is remote-reported text that ends up on the same input path as anything the user types.
-/// Quoting is left to the caller, which alone knows the receiving shell, but no amount of quoting
-/// survives a newline or carriage return: those end the submitted line and make the remainder a
-/// second command. Any control character is therefore refused outright rather than sanitized -- a
-/// path Warp cannot submit safely is one the pane simply does not `cd` into.
-pub fn submittable_remote_cwd(remote_cwd: &str) -> Option<&str> {
-    (!remote_cwd.is_empty() && !remote_cwd.chars().any(char::is_control)).then_some(remote_cwd)
-}
-
 #[cfg(test)]
 #[path = "util_tests.rs"]
 mod tests;

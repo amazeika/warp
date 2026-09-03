@@ -15,7 +15,6 @@ use warpui::{AppContext, SingletonEntity as _};
 use crate::features::FeatureFlag;
 use crate::settings::SshSettings;
 use crate::terminal::model::session::{IsSSHWrapperSession, SessionType};
-use crate::terminal::ssh::util::submittable_remote_cwd;
 
 /// Set on a split pane's local shell to ask the SSH wrapper to attach to an existing
 /// ControlMaster rather than create its own. The wrapper consumes and unsets it on its first
@@ -28,11 +27,6 @@ pub const ATTACH_CONTROL_PATH_ENV: &str = "WARP_SSH_ATTACH_CONTROL_PATH";
 pub struct SshCloneRequest {
     pub socket_path: PathBuf,
     pub command: String,
-    /// The source pane's remote directory for the new pane to enter once its own session has
-    /// bootstrapped. Already refused if it cannot be submitted safely; still unquoted, because
-    /// the shell that will receive it is not known until that session reports itself. Absent when
-    /// the source pane reported no remote directory.
-    pub remote_cwd: Option<String>,
 }
 
 /// The facts about a source pane's active session that decide whether a split may attach to it.
@@ -49,9 +43,6 @@ pub struct SshCloneFacts {
     pub bound_command: Option<String>,
     /// The WSL distro the source session runs in, if any.
     pub wsl_distro: Option<String>,
-    /// The source pane's remote working directory as the remote host reported it, from the active
-    /// block's metadata. Raw and untrusted: it is filtered before any `cd` is built from it.
-    pub remote_cwd: Option<String>,
 }
 
 /// Why a split fell back to an ordinary local pane instead of joining its source's connection.
@@ -218,11 +209,6 @@ pub fn clone_request(
             .ok_or(CloneDeclined::NoBoundCommand)?,
         // An unknown or unsubmittable directory costs the split nothing: the new pane lands in the
         // remote default, which is where a fresh `ssh` would have put it anyway.
-        remote_cwd: source
-            .remote_cwd
-            .as_deref()
-            .and_then(submittable_remote_cwd)
-            .map(str::to_owned),
     })
 }
 

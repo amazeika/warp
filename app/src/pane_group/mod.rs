@@ -6904,7 +6904,7 @@ impl PaneGroup {
         if let Some(request) = ssh_clone_request {
             view.update(ctx, |terminal_view, ctx| {
                 terminal_view.set_pending_command_queue(vec![request.command], ctx);
-                terminal_view.set_pending_ssh_clone(request.remote_cwd);
+                terminal_view.set_pending_ssh_clone();
                 // Entering agent view now would put a conversation over a pane that is still
                 // submitting `ssh`, so the user would be talking to an agent on their laptop while
                 // the pane authenticates to a remote host. Defer it the way the tab-config path
