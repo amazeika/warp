@@ -127,6 +127,15 @@ pub enum CodeSource {
         location: LocalOrRemotePath,
         origin: SkillOpenOrigin,
     },
+    /// Opened by an installed extension through the extension API.
+    ///
+    /// The extension is named rather than folded into one "extension" source,
+    /// because the interesting question about a file Warp opened on its own is
+    /// which installed thing asked for it.
+    Extension {
+        extension_id: String,
+        location: LocalOrRemotePath,
+    },
 }
 
 impl CodeSource {
@@ -141,7 +150,8 @@ impl CodeSource {
             | Self::FileTree { .. }
             | Self::CommandPalette { .. }
             | Self::Finder { .. }
-            | Self::Skill { .. } => None,
+            | Self::Skill { .. }
+            | Self::Extension { .. } => None,
         }
     }
 
@@ -155,9 +165,9 @@ impl CodeSource {
                 }
             }
             Self::Link { path, .. } | Self::Finder { path } => Some(path.clone()),
-            Self::ProjectRules { location } | Self::Skill { location, .. } => {
-                location.to_local_path().map(Path::to_path_buf)
-            }
+            Self::ProjectRules { location }
+            | Self::Skill { location, .. }
+            | Self::Extension { location, .. } => location.to_local_path().map(Path::to_path_buf),
         }
     }
 
@@ -183,9 +193,9 @@ impl CodeSource {
             Self::Link { path, .. } | Self::Finder { path } => {
                 Some(LocalOrRemotePath::Local(path.clone()))
             }
-            Self::ProjectRules { location } | Self::Skill { location, .. } => {
-                Some(location.clone())
-            }
+            Self::ProjectRules { location }
+            | Self::Skill { location, .. }
+            | Self::Extension { location, .. } => Some(location.clone()),
         }
     }
 
@@ -229,6 +239,11 @@ impl CodeSource {
             Self::CommandPalette { .. } => "command_palette",
             Self::Finder { .. } => "finder",
             Self::Skill { .. } => "skill",
+            Self::Extension {
+                location: LocalOrRemotePath::Remote(_),
+                ..
+            } => "remote_extension",
+            Self::Extension { .. } => "extension",
         }
     }
 
@@ -250,6 +265,10 @@ impl CodeSource {
                     location: LocalOrRemotePath::Remote(_),
                 }
                 | Self::Skill {
+                    location: LocalOrRemotePath::Remote(_),
+                    ..
+                }
+                | Self::Extension {
                     location: LocalOrRemotePath::Remote(_),
                     ..
                 }

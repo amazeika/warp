@@ -649,6 +649,8 @@ pub struct CodeReviewView {
     pending_precise_scroll: Option<PendingPreciseScroll>,
     /// Comment to scroll to once the view finishes loading.
     pending_jump_to_comment: Option<CommentId>,
+    /// Repo-relative file to scroll to once the view finishes loading.
+    pending_reveal_file: Option<String>,
 
     active_comment_model: Option<ModelHandle<ReviewCommentBatch>>,
 
@@ -1352,6 +1354,7 @@ impl CodeReviewView {
             comment_composer: None,
             pending_precise_scroll: None,
             pending_jump_to_comment: None,
+            pending_reveal_file: None,
             active_comment_model: None,
             init_project_button,
             #[cfg(not(target_family = "wasm"))]
@@ -2574,6 +2577,10 @@ impl CodeReviewView {
 
         if let Some(comment_id) = self.pending_jump_to_comment.take() {
             self.handle_jump_to_comment_location(&comment_id, ctx);
+        }
+
+        if let Some(path) = self.pending_reveal_file.take() {
+            self.reveal_file(path, ctx);
         }
 
         ctx.notify();
@@ -5998,6 +6005,69 @@ impl CodeReviewView {
         }
     }
 
+    /// Expands one file in the review and scrolls to it.
+    ///
+    /// Early-returns when the repo, state or file is missing, so neither
+    /// `invalidate_height_for_index` nor `scroll_to` is ever handed an index
+    /// the list does not have.
+    fn select_file(&mut self, file_index: usize, ctx: &mut ViewContext<Self>) {
+        let was_expanded = {
+            let Some(repo) = self.active_repo.as_mut() else {
+                return;
+            };
+            let CodeReviewViewState::Loaded(state) = &mut repo.state else {
+                return;
+            };
+            let Some((_, file)) = state.file_states.get_index_mut(file_index) else {
+                return;
+            };
+            let was_expanded = file.is_expanded;
+            file.is_expanded = true;
+            was_expanded
+        };
+
+        self.viewported_list_state
+            .invalidate_height_for_index(file_index);
+
+        if !was_expanded
+            && self.find_model.as_ref(ctx).is_find_bar_open()
+            && FeatureFlag::CodeReviewFind.is_enabled()
+        {
+            self.find_model.update(ctx, |model, model_ctx| {
+                model.run_search(self.editor_handles(), model_ctx);
+            });
+        }
+
+        ctx.notify();
+
+        self.viewported_list_state.scroll_to(file_index);
+        ctx.notify();
+    }
+
+    /// Scrolls the review to one file, naming it the way Git does.
+    ///
+    /// The path is repo-relative because that is how `file_states` is keyed and
+    /// how every caller outside this view — a diff request from an extension,
+    /// Git's own output — already has it, so nothing has to be resolved against
+    /// a host on the way in.
+    ///
+    /// A request that arrives before the diff has loaded is kept and applied
+    /// when it does. Opening the pane and revealing a file are one gesture, and
+    /// the diff is still loading when the second half of it runs, so the first
+    /// attempt almost always finds nothing to scroll to. A file that is simply
+    /// not in the diff leaves the review where it is: the pane is showing the
+    /// repository that was asked for, which is the part that was promised.
+    pub(crate) fn reveal_file(&mut self, repo_relative_path: String, ctx: &mut ViewContext<Self>) {
+        let CodeReviewViewState::Loaded(state) = self.state() else {
+            self.pending_reveal_file = Some(repo_relative_path);
+            return;
+        };
+        let Some(file_index) = state.file_states.get_index_of(&repo_relative_path) else {
+            return;
+        };
+        self.select_file(file_index, ctx);
+    }
+
     /// Configures the code review view to display and scroll to a specific imported comment.
     /// Sets the diff base, expands the comment list, and queues a jump to the comment location.
     pub(crate) fn navigate_to_imported_comment(
@@ -7264,39 +7334,7 @@ impl TypedActionView for CodeReviewView {
                 ctx.notify();
             }
             CodeReviewAction::FileSelected(file_index) => {
-                // Early-return when repo/state/file is missing to avoid calling
-                // invalidate_height_for_index or scroll_to with an invalid index.
-                let was_expanded = {
-                    let Some(repo) = self.active_repo.as_mut() else {
-                        return;
-                    };
-                    let CodeReviewViewState::Loaded(state) = &mut repo.state else {
-                        return;
-                    };
-                    let Some((_, file)) = state.file_states.get_index_mut(*file_index) else {
-                        return;
-                    };
-                    let was_expanded = file.is_expanded;
-                    file.is_expanded = true;
-                    was_expanded
-                };
-
-                self.viewported_list_state
-                    .invalidate_height_for_index(*file_index);
-
-                if !was_expanded
-                    && self.find_model.as_ref(ctx).is_find_bar_open()
-                    && FeatureFlag::CodeReviewFind.is_enabled()
-                {
-                    self.find_model.update(ctx, |model, model_ctx| {
-                        model.run_search(self.editor_handles(), model_ctx);
-                    });
-                }
-
-                ctx.notify();
-
-                self.viewported_list_state.scroll_to(*file_index);
-                ctx.notify();
+                self.select_file(*file_index, ctx);
             }
             CodeReviewAction::ToggleMaximize => {
                 // Determine if we're minimizing or maximizing

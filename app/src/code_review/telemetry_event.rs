@@ -93,6 +93,8 @@ pub enum CodeReviewPaneEntrypoint {
     RightPanel,
     /// Opened via the CLI agent view footer (e.g., Claude Code).
     CLIAgentView,
+    /// Opened by an installed extension through the extension API.
+    Extension,
     /// Opened via other means (unknown entry point).
     #[default]
     Other,
@@ -111,6 +113,7 @@ impl Display for CodeReviewPaneEntrypoint {
             Self::PaneHeader => write!(f, "pane_header"),
             Self::RightPanel => write!(f, "right_panel"),
             Self::CLIAgentView => write!(f, "cli_agent_view"),
+            Self::Extension => write!(f, "extension"),
             Self::Other => write!(f, "other"),
         }
     }

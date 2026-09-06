@@ -218,7 +218,7 @@ use warp_errors::report_error;
 pub use working_directories::{WorkingDirectoriesEvent, WorkingDirectoriesModel};
 
 use self::pane::{DetachType, PaneViewEvent};
-pub use crate::code_review::CodeReviewPanelArg;
+pub use crate::code_review::{CodeReviewOrigin, CodeReviewPanelArg};
 
 /// Binding name for the action that toggles maximizing the active pane. Shared so
 /// the pane header menu item can surface the same shortcut the binding resolves to.

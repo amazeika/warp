@@ -338,8 +338,8 @@ use crate::menu::{Event as MenuEvent, Menu, MenuItem, MenuItemFields};
 use crate::pane_group::focus_state::PaneFocusHandle;
 use crate::pane_group::pane::DetachType;
 use crate::pane_group::{
-    CodeReviewPanelArg, PaneConfiguration, PaneEvent, PaneGroupAction, PaneHeaderAction,
-    SplitPaneState, TerminalViewResources,
+    CodeReviewOrigin, CodeReviewPanelArg, PaneConfiguration, PaneEvent, PaneGroupAction,
+    PaneHeaderAction, SplitPaneState, TerminalViewResources,
 };
 use crate::persistence::{self, FinishedCommandMetadata};
 use crate::projects::ProjectManagementModel;
@@ -7137,7 +7137,7 @@ impl TerminalView {
     ) {
         let arg = CodeReviewPanelArg {
             repo_path: self.current_repo_path.clone(),
-            terminal_view: self.view_handle.clone(),
+            origin: CodeReviewOrigin::Terminal(self.view_handle.clone()),
             entrypoint,
             focus_new_pane,
             cli_agent,
@@ -7501,7 +7501,7 @@ impl TerminalView {
         } else {
             Some(CodeReviewPanelArg {
                 repo_path: Some(LocalOrRemotePath::Local(repo_path.to_path_buf())),
-                terminal_view: self.view_handle.clone(),
+                origin: CodeReviewOrigin::Terminal(self.view_handle.clone()),
                 entrypoint: CodeReviewPaneEntrypoint::InvokedByAgent,
                 focus_new_pane: false,
                 cli_agent: None,
@@ -21070,7 +21070,7 @@ impl TerminalView {
             } => {
                 let arg = CodeReviewPanelArg {
                     repo_path: Some(repo_path.clone()),
-                    terminal_view: self.view_handle.clone(),
+                    origin: CodeReviewOrigin::Terminal(self.view_handle.clone()),
                     entrypoint: CodeReviewPaneEntrypoint::AgentModeRunning,
                     focus_new_pane: true,
                     cli_agent: None,
@@ -21154,7 +21154,7 @@ impl TerminalView {
     fn imported_comments_panel_arg(&self) -> CodeReviewPanelArg {
         CodeReviewPanelArg {
             repo_path: self.current_repo_path.clone(),
-            terminal_view: self.view_handle.clone(),
+            origin: CodeReviewOrigin::Terminal(self.view_handle.clone()),
             entrypoint: CodeReviewPaneEntrypoint::AgentModeRunning,
             focus_new_pane: true,
             cli_agent: None,
@@ -22327,7 +22327,7 @@ impl TerminalView {
             InputEvent::OpenCodeReviewPane => {
                 ctx.emit(Event::OpenCodeReviewPane(CodeReviewPanelArg {
                     repo_path: self.current_repo_path.clone(),
-                    terminal_view: self.view_handle.clone(),
+                    origin: CodeReviewOrigin::Terminal(self.view_handle.clone()),
                     entrypoint: CodeReviewPaneEntrypoint::GitDiffChip,
                     focus_new_pane: true,
                     cli_agent: None,
@@ -27967,7 +27967,7 @@ impl TypedActionView for TerminalView {
             ToggleCodeReviewPane { entrypoint } => {
                 ctx.emit(Event::ToggleCodeReviewPane(CodeReviewPanelArg {
                     repo_path: self.current_repo_path.clone(),
-                    terminal_view: self.view_handle.clone(),
+                    origin: CodeReviewOrigin::Terminal(self.view_handle.clone()),
                     entrypoint: *entrypoint,
                     focus_new_pane: true,
                     cli_agent: None,

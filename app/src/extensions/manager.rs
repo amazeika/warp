@@ -22,15 +22,16 @@ use extension_protocol::{
 };
 use instant::Instant;
 use warp_core::SessionId;
-use warpui::WindowId;
 use warpui::r#async::Timer;
-use warpui::{AppContext, Entity, ModelContext, ModelSpawner, SingletonEntity};
+use warpui::{AppContext, Entity, ModelContext, ModelSpawner, SingletonEntity, WindowId};
 
 use super::context::{ActiveContext, WorkspaceContextService, session_id_to_string};
 use super::contributions::{ContributedCommand, ContributedPanel, Contributions};
 use super::dialog::{self, Question};
+use super::diff::DiffService;
 use super::execution::ExecutionService;
-use super::host::BridgeHost;
+use super::files::FileService;
+use super::host::{BridgeHost, OpenRequest};
 use super::permissions::{GrantStore, PermissionDecision};
 use crate::remote_server::manager::{RemoteServerManager, RemoteServerManagerEvent};
 use crate::workspace::Workspace;
@@ -738,6 +739,35 @@ impl ExtensionManager {
         );
     }
 
+    /// Puts what a plugin asked for in front of the user.
+    ///
+    /// Everything the request names is resolved first — the host a path lives
+    /// on, the repository, the base to compare against — and only then does
+    /// anything open, so a request Warp cannot place is refused without a pane
+    /// appearing for it. The plugin is answered either way: `file.open` and
+    /// `diff.open*` return nothing on success, and a plugin that is told
+    /// nothing at all cannot tell a slow open from one that never happened.
+    fn open(
+        &mut self,
+        extension_id: &str,
+        request_id: String,
+        what: OpenRequest,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let result = match what {
+            OpenRequest::File(params) => FileService::resolve(&params, ctx)
+                .and_then(|request| request.show(extension_id, ctx)),
+            OpenRequest::DiffWorkingTree(params) => {
+                DiffService::working_tree(&params, ctx).and_then(|request| request.show(ctx))
+            }
+            OpenRequest::DiffFile(params) => {
+                DiffService::file(&params, ctx).and_then(|request| request.show(ctx))
+            }
+        };
+        let result = result.map(|()| serde_json::Value::Object(Default::default()));
+        self.respond(extension_id, request_id, result);
+    }
+
     /// Writes one deferred answer back to the plugin waiting for it.
     ///
     /// An extension that stopped while its answer was being produced is not
@@ -903,7 +933,7 @@ impl ExtensionManager {
         message: Message,
         ctx: &mut ModelContext<Self>,
     ) -> bool {
-        let (became_initialized, question, panel_state, execution) = {
+        let (became_initialized, question, panel_state, execution, open) = {
             let Some(extension) = self.extensions.get_mut(extension_id) else {
                 return false;
             };
@@ -919,11 +949,13 @@ impl ExtensionManager {
                 question: None,
                 panel_state: None,
                 execution: None,
+                open: None,
             };
             let reply = running.session.handle_message(message, &mut host);
             let question = host.question;
             let panel_state = host.panel_state;
             let execution = host.execution;
+            let open = host.open;
 
             if let Some(reply) = reply
                 && let Err(err) = running.process.send(&reply)
@@ -935,7 +967,7 @@ impl ExtensionManager {
             if became_initialized {
                 extension.state.running();
             }
-            (became_initialized, question, panel_state, execution)
+            (became_initialized, question, panel_state, execution, open)
         };
 
         // Applied out here because each touches the manager as a whole, and the
@@ -948,6 +980,9 @@ impl ExtensionManager {
         }
         if let Some(execution) = execution {
             self.run_execution(extension_id, execution.request_id, execution.params, ctx);
+        }
+        if let Some(open) = open {
+            self.open(extension_id, open.request_id, open.what, ctx);
         }
         became_initialized
     }

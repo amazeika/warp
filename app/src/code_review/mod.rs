@@ -25,16 +25,63 @@ pub(crate) mod diff_selector;
 pub(crate) mod file_invalidation_queue;
 
 use code_review_view::CodeReviewAction;
+use warp_core::SessionId;
 use warpui::keymap::{EditableBinding, FixedBinding};
 use warpui::{
     AppContext, Entity, EntityId, ModelContext, SingletonEntity, WeakViewHandle, WindowId, id,
 };
 
+use crate::BlocklistAIHistoryModel;
+use crate::ai::agent::conversation::AIConversationId;
 use crate::code::buffer_location::LocalOrRemotePath;
 use crate::code_review::telemetry_event::CodeReviewPaneEntrypoint;
 use crate::terminal::CLIAgent;
 use crate::terminal::view::TerminalView;
 use crate::util::bindings::CustomAction;
+
+/// Where a request to open the review panel came from.
+///
+/// The panel needs two things that a terminal pane happens to hold: the
+/// session the diff should load over, and the conversation to mark as having
+/// had a review opened. Naming the origin rather than the pane is what lets
+/// something outside the pane tree — the extension API — ask for a diff at
+/// all, and it keeps the two questions separable: an origin can answer the
+/// first without having an answer to the second.
+#[derive(Clone)]
+pub enum CodeReviewOrigin {
+    /// The pane the user was in when they asked.
+    Terminal(WeakViewHandle<TerminalView>),
+    /// A caller with no pane of its own. The session to load the diff over is
+    /// named outright rather than read off whichever view happens to be
+    /// focused, so a diff of a remote repository cannot be loaded over a local
+    /// session that shares its path.
+    Detached { session_id: Option<SessionId> },
+}
+
+impl CodeReviewOrigin {
+    /// The session the diff should be loaded over, if there is one.
+    pub fn preferred_session(&self, ctx: &AppContext) -> Option<SessionId> {
+        match self {
+            Self::Terminal(view) => view
+                .upgrade(ctx)
+                .and_then(|view| view.as_ref(ctx).active_block_session_id()),
+            Self::Detached { session_id } => *session_id,
+        }
+    }
+
+    /// The conversation that should record that a review was opened.
+    ///
+    /// Only a terminal origin has one: the record exists to tell an agent
+    /// conversation that its changes were looked at, and an origin with no
+    /// conversation behind it has nothing to say about one.
+    pub fn conversation_id(&self, ctx: &AppContext) -> Option<AIConversationId> {
+        let Self::Terminal(view) = self else {
+            return None;
+        };
+        let view = view.upgrade(ctx)?;
+        BlocklistAIHistoryModel::as_ref(ctx).active_conversation_id(view.id())
+    }
+}
 
 /// Arguments needed to open or toggle the code review panel.
 /// Bundled into a struct so that events can atomically open the
@@ -42,7 +89,7 @@ use crate::util::bindings::CustomAction;
 #[derive(Clone)]
 pub struct CodeReviewPanelArg {
     pub repo_path: Option<LocalOrRemotePath>,
-    pub terminal_view: WeakViewHandle<TerminalView>,
+    pub origin: CodeReviewOrigin,
     pub entrypoint: CodeReviewPaneEntrypoint,
     pub focus_new_pane: bool,
     pub cli_agent: Option<CLIAgent>,

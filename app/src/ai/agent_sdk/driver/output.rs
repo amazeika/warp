@@ -1403,6 +1403,7 @@ fn format_agent_text<W: Write>(text: &AIAgentText, w: &mut W) -> io::Result<()> 
                     | Some(CodeSource::FileTree { .. })
                     | Some(CodeSource::CommandPalette { .. })
                     | Some(CodeSource::Finder { .. })
+                    | Some(CodeSource::Extension { .. })
                     | None => {}
                 }
 

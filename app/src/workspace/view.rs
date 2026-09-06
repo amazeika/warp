@@ -264,7 +264,7 @@ use crate::code::editor_management::CodeSource;
 #[cfg(feature = "local_fs")]
 use crate::code_review::CodeReviewTelemetryEvent;
 use crate::code_review::GlobalCodeReviewModel;
-use crate::code_review::diff_state::DiffStateModel;
+use crate::code_review::diff_state::{DiffMode, DiffStateModel};
 use crate::code_review::telemetry_event::CodeReviewPaneEntrypoint;
 use crate::coding_panel_enablement_state::CodingPanelEnablementState;
 use crate::context_chips::ChipRuntimeCapabilities;
@@ -9570,12 +9570,18 @@ impl Workspace {
         }
     }
 
+    /// Opens the review panel for `panel_context`, returning whether the panel
+    /// ended up showing the repository it named.
+    ///
+    /// The answer is reported rather than only acted on because a caller can
+    /// owe one elsewhere: an extension that asked for a diff has to be told
+    /// that no panel opened, instead of being answered as though one had.
     fn open_code_review_panel_from_arg(
         &mut self,
         panel_context: &CodeReviewPanelArg,
         pane_group: ViewHandle<PaneGroup>,
         ctx: &mut ViewContext<Self>,
-    ) {
+    ) -> bool {
         // Skip the full panel setup when the panel is already open for the target repo.
         let panel_already_showing_repo = pane_group.as_ref(ctx).right_panel_open
             && panel_context
@@ -9585,21 +9591,18 @@ impl Workspace {
                     self.right_panel_view.as_ref(ctx).selected_repo_path() == Some(target_repo_path)
                 });
         if panel_already_showing_repo {
-            return;
+            return true;
         }
 
         let repo_location = panel_context.repo_path.clone();
-        let preferred_session = panel_context
-            .terminal_view
-            .upgrade(ctx)
-            .and_then(|tv| tv.as_ref(ctx).active_block_session_id());
+        let preferred_session = panel_context.origin.preferred_session(ctx);
         let diff_state_model = repo_location.as_ref().and_then(|rp| {
             self.working_directories_model.update(ctx, |model, ctx| {
                 model.get_or_create_diff_state_model(rp.clone(), preferred_session, ctx)
             })
         });
         let Some(diff_state_model) = diff_state_model else {
-            return;
+            return false;
         };
         let context = CodeReviewPaneContext {
             repo_path: repo_location,
@@ -9614,16 +9617,121 @@ impl Workspace {
             ctx,
         );
 
-        let active_conversation_id = panel_context
-            .terminal_view
-            .upgrade(ctx)
-            .and_then(|tv| BlocklistAIHistoryModel::as_ref(ctx).active_conversation_id(tv.id()));
+        let active_conversation_id = panel_context.origin.conversation_id(ctx);
 
         if let Some(conversation_id) = active_conversation_id {
             BlocklistAIHistoryModel::handle(ctx).update(ctx, |history_model, _| {
                 history_model.set_has_code_review_opened_to_true(conversation_id);
             });
         }
+        true
+    }
+
+    /// Opens the review panel for a caller that has no pane of its own.
+    ///
+    /// The terminal path reaches [`Self::open_code_review_panel_from_arg`]
+    /// through the pane group that emitted the event; a caller outside the pane
+    /// tree names the repository instead and lands on the active tab's group,
+    /// which is the one in front of the user.
+    ///
+    /// `reveal_file` is repo-relative, and a file that is not in the diff is
+    /// not a failure: the panel is showing the repository that was asked for,
+    /// which is what opening it promised.
+    #[cfg(feature = "local_fs")]
+    pub fn open_code_review_panel_detached(
+        &mut self,
+        panel_context: &CodeReviewPanelArg,
+        diff_mode: DiffMode,
+        reveal_file: Option<String>,
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
+        let pane_group = self.active_tab_pane_group().clone();
+        if !self.open_code_review_panel_from_arg(panel_context, pane_group.clone(), ctx) {
+            return false;
+        }
+        let Some(repo_path) = &panel_context.repo_path else {
+            return false;
+        };
+        let Some(code_review_view) = self
+            .working_directories_model
+            .as_ref(ctx)
+            .get_code_review_view(pane_group.id(), repo_path)
+        else {
+            return false;
+        };
+        code_review_view.update(ctx, |code_review_view, ctx| {
+            // Only when it differs: setting the base invalidates every editor
+            // in the review, which is wasted work on a panel already showing
+            // the comparison that was asked for.
+            if code_review_view
+                .diff_state_model()
+                .as_ref(ctx)
+                .diff_mode(ctx)
+                != diff_mode
+            {
+                code_review_view.set_diff_base(diff_mode, ctx);
+            }
+            if let Some(path) = reveal_file {
+                code_review_view.reveal_file(path, ctx);
+            }
+        });
+        true
+    }
+
+    /// Opens a file an extension pointed Warp at, in one of Warp's own viewers.
+    ///
+    /// Never an external editor: `preferred_view` chooses between Warp's
+    /// viewers, an extension asking Warp to open a file means in Warp, and a
+    /// file on a remote host has no external editor to reach in the first
+    /// place.
+    #[cfg(feature = "local_fs")]
+    pub fn open_file_for_extension(
+        &mut self,
+        extension_id: String,
+        location: LocalOrRemotePath,
+        line_col: Option<LineAndColumnArg>,
+        session_id: Option<SessionId>,
+        markdown: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let layout = *EditorSettings::as_ref(ctx).open_file_layout.value();
+        let source = CodeSource::Extension {
+            extension_id,
+            location: location.clone(),
+        };
+        if markdown {
+            // The notebook viewer reads a remote file over the session it was
+            // told about rather than the focused pane's, so a file opened on
+            // one host is not fetched over another.
+            let session = session_id.and_then(|session_id| self.session_by_id(session_id, ctx));
+            self.open_file_notebook(location, session, layout, Some(source), ctx);
+        } else {
+            self.open_code(source, layout, line_col, false /* preview */, &[], ctx);
+        }
+    }
+
+    /// The session with this id, from wherever in the workspace it is running.
+    ///
+    /// Looked up by id rather than by focus: a remote file has to be read over
+    /// the session it lives on, and the pane the user happens to be looking at
+    /// is not necessarily that session's pane.
+    #[cfg(feature = "local_fs")]
+    fn session_by_id(
+        &self,
+        session_id: SessionId,
+        ctx: &mut ViewContext<Self>,
+    ) -> Option<Arc<Session>> {
+        let pane_group = self.active_tab_pane_group().clone();
+        let terminal_view = pane_group
+            .as_ref(ctx)
+            .active_session_id(ctx)
+            .and_then(|pane_id| {
+                pane_group
+                    .as_ref(ctx)
+                    .terminal_view_from_pane_id(pane_id, ctx)
+            })?;
+        let sessions = terminal_view.as_ref(ctx).sessions_model().clone();
+        sessions.as_ref(ctx).get(session_id)
     }
 
     fn update_right_panel_open_state(
@@ -16385,9 +16493,7 @@ impl Workspace {
             }
             pane_group::Event::ToggleCodeReviewPane(arg) => {
                 self.toggle_right_panel(&pane_group, ctx);
-                let active_conversation_id = arg.terminal_view.upgrade(ctx).and_then(|tv| {
-                    BlocklistAIHistoryModel::as_ref(ctx).active_conversation_id(tv.id())
-                });
+                let active_conversation_id = arg.origin.conversation_id(ctx);
                 if let Some(conversation_id) = active_conversation_id {
                     BlocklistAIHistoryModel::handle(ctx).update(ctx, |history_model, _| {
                         history_model.set_has_code_review_opened_to_true(conversation_id);

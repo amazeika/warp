@@ -6,8 +6,9 @@
 //! and permission gates by the time a call arrives.
 use extension_host::{Dispatched, ExtensionHost};
 use extension_protocol::{
-    Capability, DialogConfirmParams, ErrorCode, ExecutionRunParams, ExtensionError, Method,
-    NotificationLevel, NotificationParams, PanelViewState, decode_params,
+    Capability, DialogConfirmParams, DiffOpenFileParams, DiffOpenWorkingTreeParams, ErrorCode,
+    ExecutionRunParams, ExtensionError, FileOpenParams, Method, NotificationLevel,
+    NotificationParams, PanelViewState, decode_params,
 };
 use warpui::windowing::WindowManager;
 use warpui::{ModelContext, SingletonEntity as _};
@@ -32,6 +33,8 @@ pub(super) const IMPLEMENTED_CAPABILITIES: &[Capability] = &[
     Capability::DialogConfirmV1,
     Capability::WorkspaceContextV1,
     Capability::ExecutionV1,
+    Capability::DiffOpenV1,
+    Capability::FileOpenV1,
 ];
 
 pub(super) struct BridgeHost<'a, 'ctx> {
@@ -53,6 +56,11 @@ pub(super) struct BridgeHost<'a, 'ctx> {
     /// A command this dispatch accepted, for the manager to start once its own
     /// borrow of the extension has ended, for the same reason again.
     pub execution: Option<PendingExecution>,
+    /// Something this dispatch is putting in front of the user, for the manager
+    /// to open once its own borrow of the extension has ended. Opening a pane
+    /// reaches through the workspace and back into extension state, so it is
+    /// the one thing that must not happen while an extension is borrowed.
+    pub open: Option<PendingOpen>,
 }
 
 /// A `dialog.confirm` waiting to be put in front of the user.
@@ -65,6 +73,22 @@ pub(super) struct PendingConfirm {
 pub(super) struct PendingExecution {
     pub request_id: String,
     pub params: ExecutionRunParams,
+}
+
+/// A request to put something in front of the user, waiting for a window.
+pub(super) struct PendingOpen {
+    pub request_id: String,
+    pub what: OpenRequest,
+}
+
+/// What a plugin asked Warp to show.
+///
+/// The three share one deferral because they share the one thing that makes
+/// deferring necessary — a workspace view — not because they resolve alike.
+pub(super) enum OpenRequest {
+    File(FileOpenParams),
+    DiffWorkingTree(DiffOpenWorkingTreeParams),
+    DiffFile(DiffOpenFileParams),
 }
 
 impl ExtensionHost for BridgeHost<'_, '_> {
@@ -120,6 +144,15 @@ impl ExtensionHost for BridgeHost<'_, '_> {
                 }
                 Err(error) => Dispatched::Answered(Err(error)),
             },
+            // Nothing is written back for the three below either. Each has to
+            // reach the workspace, and the workspace can reach back into
+            // extension state, so the open happens after the manager's borrow
+            // of this extension has ended and the manager owes the answer.
+            Method::FileOpen => self.defer(request_id, method, &params, OpenRequest::File),
+            Method::DiffOpenWorkingTree => {
+                self.defer(request_id, method, &params, OpenRequest::DiffWorkingTree)
+            }
+            Method::DiffOpenFile => self.defer(request_id, method, &params, OpenRequest::DiffFile),
             // `dialog.input` and `dialog.select` share the `dialog.confirm.v1`
             // token with the method above, so they reach dispatch rather than
             // being refused by the capability gate. The code is still the right
@@ -128,20 +161,41 @@ impl ExtensionHost for BridgeHost<'_, '_> {
             // Everything else is gated by a capability this build does not
             // advertise at all, so `Session` refuses it before dispatch.
             // Answering here as well keeps the failure honest if that changes.
-            Method::ExtensionInitialize
-            | Method::FileOpen
-            | Method::DiffOpenWorkingTree
-            | Method::DiffOpenFile
-            | Method::DialogInput
-            | Method::DialogSelect => Dispatched::Answered(Err(ExtensionError::new(
-                ErrorCode::UnsupportedCapability,
-                format!("{method} is not implemented by this Warp build"),
-            ))),
+            Method::ExtensionInitialize | Method::DialogInput | Method::DialogSelect => {
+                Dispatched::Answered(Err(ExtensionError::new(
+                    ErrorCode::UnsupportedCapability,
+                    format!("{method} is not implemented by this Warp build"),
+                )))
+            }
         }
     }
 }
 
 impl BridgeHost<'_, '_> {
+    /// Decodes an open request and hands it to the manager to perform.
+    ///
+    /// Decoding still happens here so a malformed request is refused by the
+    /// same gate as every other one, and only a request that is at least
+    /// well-formed survives long enough to reach a window.
+    fn defer<P: serde::de::DeserializeOwned>(
+        &mut self,
+        request_id: &str,
+        method: Method,
+        params: &serde_json::Value,
+        into: impl FnOnce(P) -> OpenRequest,
+    ) -> Dispatched {
+        match decode_params(method, params) {
+            Ok(params) => {
+                self.open = Some(PendingOpen {
+                    request_id: request_id.to_owned(),
+                    what: into(params),
+                });
+                Dispatched::Deferred
+            }
+            Err(error) => Dispatched::Answered(Err(error)),
+        }
+    }
+
     /// Answers `workspace.getContext` with the state at the moment it was
     /// asked, rather than with whatever the last context event described.
     ///

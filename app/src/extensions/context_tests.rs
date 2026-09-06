@@ -209,3 +209,67 @@ fn every_context_event_encodes() {
         assert_eq!(envelope.event, event.kind);
     }
 }
+
+#[test]
+fn a_local_path_is_bound_to_this_machine() {
+    warpui::App::test((), |mut app| async move {
+        app.update(|ctx| {
+            assert_eq!(
+                resolve_path(&ExecutionTarget::Local, "/home/dev/repo/src/main.rs", ctx)
+                    .expect("a local path"),
+                local("/home/dev/repo/src/main.rs")
+            );
+        });
+    });
+}
+
+#[test]
+fn a_relative_path_is_never_completed_from_somewhere_warp_picked() {
+    warpui::App::test((), |mut app| async move {
+        app.update(|ctx| {
+            let error = resolve_path(&ExecutionTarget::Local, "src/main.rs", ctx)
+                .expect_err("not an absolute path");
+            assert_eq!(error.code, ErrorCode::InvalidRequest);
+        });
+    });
+}
+
+#[test]
+fn a_remote_path_is_never_resolved_to_the_same_named_local_file() {
+    warpui::App::test((), |mut app| async move {
+        app.update(|ctx| {
+            // The session is one this build has never heard of, which is the
+            // case that matters: the highest-consequence failure this API has
+            // is acting on `/srv/repo` here when the plugin meant `/srv/repo`
+            // over there.
+            let resolved = resolve_path(
+                &ExecutionTarget::Ssh {
+                    session_id: "12".to_owned(),
+                },
+                "/srv/repo/src/main.rs",
+                ctx,
+            );
+            match resolved {
+                Ok(path) => panic!("a remote path must not resolve to {path:?}"),
+                Err(error) => assert_eq!(error.code, ErrorCode::TargetStale),
+            }
+        });
+    });
+}
+
+#[test]
+fn a_session_id_that_is_not_one_is_a_bad_request_rather_than_a_stale_target() {
+    warpui::App::test((), |mut app| async move {
+        app.update(|ctx| {
+            let error = resolve_path(
+                &ExecutionTarget::Ssh {
+                    session_id: "over-there".to_owned(),
+                },
+                "/srv/repo",
+                ctx,
+            )
+            .expect_err("not a session id");
+            assert_eq!(error.code, ErrorCode::InvalidRequest);
+        });
+    });
+}

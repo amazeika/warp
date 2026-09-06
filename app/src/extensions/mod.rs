@@ -31,7 +31,9 @@
 mod context;
 mod contributions;
 mod dialog;
+mod diff;
 mod execution;
+mod files;
 mod host;
 mod manager;
 mod permissions;

@@ -8,15 +8,20 @@
 //! The walk over that state is covered by running Warp; everything that
 //! decides what the pieces *mean* — how they flatten onto the wire, and which
 //! events a change produces — is pure and tested here.
+use std::path::PathBuf;
+
 use extension_protocol::{
-    ActionOrigin, ContextChangedParams, EventEnvelope, EventKind, ExecutionTarget, ExtensionError,
-    SessionChangedParams, WorkspaceContext,
+    ActionOrigin, ContextChangedParams, ErrorCode, EventEnvelope, EventKind, ExecutionTarget,
+    ExtensionError, SessionChangedParams, WorkspaceContext,
 };
 use repo_metadata::repositories::DetectedRepositories;
 use warp_core::SessionId;
 use warp_util::local_or_remote_path::LocalOrRemotePath;
-use warpui::{AppContext, SingletonEntity as _, WindowId};
+use warp_util::remote_path::RemotePath;
+use warp_util::standardized_path::StandardizedPath;
+use warpui::{AppContext, SingletonEntity as _, ViewHandle, WindowId};
 
+use super::execution::ExecutionService;
 use crate::workspace::{Workspace, WorkspaceRegistry};
 
 /// Everything Warp knows about where the user is acting, before it is
@@ -101,6 +106,66 @@ impl ActiveContext {
 /// carries back when a plugin acts on the session it was told about.
 pub(super) fn session_id_to_string(session_id: SessionId) -> String {
     session_id.as_u64().to_string()
+}
+
+/// Binds a path a plugin named to the host its execution target names.
+///
+/// The target decides the host, never the shape of the path: `/srv/repo` is a
+/// real directory on both machines and the two are different places. A remote
+/// target Warp cannot place is refused here rather than resolved, for the same
+/// reason [`super::execution::ExecutionService::resolve`] never falls back to
+/// the local machine — opening or acting on the same-named local file is the
+/// highest-consequence failure this API has.
+///
+/// Absolute is required on both paths. A relative one would have to be
+/// completed from somewhere, and every candidate — Warp's own process
+/// directory, whichever pane is focused — names a place the plugin did not ask
+/// for.
+pub(super) fn resolve_path(
+    target: &ExecutionTarget,
+    path: &str,
+    ctx: &AppContext,
+) -> Result<LocalOrRemotePath, ExtensionError> {
+    match target {
+        ExecutionTarget::Local => {
+            let local = PathBuf::from(path);
+            if !local.is_absolute() {
+                return Err(not_absolute(path));
+            }
+            Ok(LocalOrRemotePath::Local(local))
+        }
+        ExecutionTarget::Ssh { session_id } => {
+            let host_id = ExecutionService::host_id(session_id, ctx)?;
+            let path = StandardizedPath::try_new(path).map_err(|_| not_absolute(path))?;
+            Ok(LocalOrRemotePath::Remote(RemotePath::new(host_id, path)))
+        }
+    }
+}
+
+/// The workspace a plugin's request should land in.
+///
+/// The active window's, because that is the one in front of the user: a plugin
+/// asking Warp to show something is asking for it where the user is looking,
+/// and a request that arrives with no window open has nowhere to be shown
+/// rather than somewhere arbitrary.
+pub(super) fn active_workspace(ctx: &AppContext) -> Result<ViewHandle<Workspace>, ExtensionError> {
+    let missing = || {
+        ExtensionError::new(
+            ErrorCode::WorkspaceMissing,
+            "there is no active workspace to show this in",
+        )
+    };
+    let window_id = ctx.windows().active_window().ok_or_else(missing)?;
+    ctx.views_of_type::<Workspace>(window_id)
+        .and_then(|workspaces| workspaces.first().cloned())
+        .ok_or_else(missing)
+}
+
+fn not_absolute(path: &str) -> ExtensionError {
+    ExtensionError::new(
+        ErrorCode::InvalidRequest,
+        format!("`{path}` is not an absolute path"),
+    )
 }
 
 /// One context event, ready to be encoded for every running extension.

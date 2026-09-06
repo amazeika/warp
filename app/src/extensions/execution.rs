@@ -17,6 +17,7 @@ use futures::FutureExt as _;
 use futures::future::{Either, select};
 use instant::Instant;
 use warp_core::SessionId;
+use warp_util::host_id::HostId;
 use warpui::r#async::Timer;
 use warpui::{AppContext, SingletonEntity as _};
 
@@ -78,9 +79,27 @@ impl ExecutionService {
         };
         Ok(Runner::Remote { session_id, client })
     }
+
+    /// The host a session is running on.
+    ///
+    /// Separate from [`Self::resolve`] because a path is bound to a host while
+    /// a command is bound to a transport, and the two are wanted by different
+    /// callers — but they fail for the same reasons and say so identically, so
+    /// the refusal is shared.
+    pub(super) fn host_id(session_id: &str, ctx: &AppContext) -> Result<HostId, ExtensionError> {
+        let session_id = parse_session_id(session_id)?;
+        if !ctx.has_singleton_model::<RemoteServerManager>() {
+            return Err(refusal(session_id, false));
+        }
+        let manager = RemoteServerManager::as_ref(ctx);
+        manager
+            .host_id_for_session(session_id)
+            .cloned()
+            .ok_or_else(|| refusal(session_id, manager.tracks_session(session_id)))
+    }
 }
 
-fn parse_session_id(session_id: &str) -> Result<SessionId, ExtensionError> {
+pub(super) fn parse_session_id(session_id: &str) -> Result<SessionId, ExtensionError> {
     session_id.parse::<u64>().map(SessionId::from).map_err(|_| {
         ExtensionError::new(
             ErrorCode::InvalidRequest,
@@ -96,7 +115,7 @@ fn parse_session_id(session_id: &str) -> Result<SessionId, ExtensionError> {
 /// the plugin was right to hold, so `session_disconnected` invites it to ask
 /// for the context again; one Warp never had is `target_stale`, which says the
 /// target itself was never Warp's to run on.
-fn refusal(session_id: SessionId, tracked: bool) -> ExtensionError {
+pub(super) fn refusal(session_id: SessionId, tracked: bool) -> ExtensionError {
     let session_id = session_id.as_u64();
     match tracked {
         true => ExtensionError::new(
