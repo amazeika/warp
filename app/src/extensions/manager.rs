@@ -16,8 +16,8 @@ use extension_host::{
 };
 use extension_protocol::{
     ActionOrigin, Activation, CommandInvokedParams, DialogConfirmParams, DialogConfirmResult,
-    EventEnvelope, EventKind, ExecutionTarget, ExtensionManifest, Message, Permission,
-    PermissionSet, ResponseEnvelope,
+    EventEnvelope, EventKind, ExecutionTarget, ExtensionManifest, Message, PanelActionParams,
+    PanelViewState, Permission, PermissionSet, ResponseEnvelope,
 };
 use instant::Instant;
 use warpui::r#async::Timer;
@@ -49,6 +49,11 @@ const ASK_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 pub enum ExtensionManagerEvent {
     /// A command or panel appeared or disappeared.
     ContributionsChanged,
+    /// An extension published a new snapshot of one of its panels.
+    PanelStateChanged {
+        extension_id: String,
+        panel_id: String,
+    },
     /// Warp has given up restarting this extension.
     Failed {
         extension_id: String,
@@ -119,6 +124,10 @@ pub struct ExtensionManager {
     root: PathBuf,
     grants: GrantStore,
     contributions: Contributions,
+    /// The latest snapshot each running extension published, keyed by extension
+    /// and panel id. Warp keeps only the newest: the model is a whole picture
+    /// of the panel, not a stream of edits, so an older one has no use.
+    panel_states: BTreeMap<(String, String), PanelViewState>,
     extensions: BTreeMap<String, ManagedExtension>,
     /// Directories that claimed to be extensions but cannot run, kept with
     /// their reason so the UI can say why rather than silently omitting them.
@@ -164,6 +173,7 @@ impl ExtensionManager {
             root,
             grants,
             contributions: Contributions::default(),
+            panel_states: BTreeMap::new(),
             extensions: BTreeMap::new(),
             rejected: Vec::new(),
             spawner: ctx.spawner(),
@@ -624,6 +634,11 @@ impl ExtensionManager {
 
     fn stopped(&mut self, extension_id: &str, reason: StopReason, ctx: &mut ModelContext<Self>) {
         self.contributions.unregister(extension_id);
+        // The snapshots go with the panels they belonged to. Keeping them would
+        // leave a panel showing a repository state nothing is maintaining any
+        // more, which reads as current and is not.
+        self.panel_states
+            .retain(|(owner, _), _| owner != extension_id);
         ctx.emit(ExtensionManagerEvent::ContributionsChanged);
 
         let Some(extension) = self.extensions.get_mut(extension_id) else {
@@ -679,7 +694,7 @@ impl ExtensionManager {
         message: Message,
         ctx: &mut ModelContext<Self>,
     ) -> bool {
-        let (became_initialized, question) = {
+        let (became_initialized, question, panel_state) = {
             let Some(extension) = self.extensions.get_mut(extension_id) else {
                 return false;
             };
@@ -693,9 +708,11 @@ impl ExtensionManager {
                 extension_name: extension.manifest.name.clone(),
                 ctx,
                 question: None,
+                panel_state: None,
             };
             let reply = running.session.handle_message(message, &mut host);
             let question = host.question;
+            let panel_state = host.panel_state;
 
             if let Some(reply) = reply
                 && let Err(err) = running.process.send(&reply)
@@ -707,15 +724,95 @@ impl ExtensionManager {
             if became_initialized {
                 extension.state.running();
             }
-            (became_initialized, question)
+            (became_initialized, question, panel_state)
         };
 
-        // Queued out here because asking touches the manager as a whole, and
-        // the dispatch above held it borrowed for one extension.
+        // Applied out here because both touch the manager as a whole, and the
+        // dispatch above held it borrowed for one extension.
+        if let Some(state) = panel_state {
+            self.set_panel_state(extension_id, state, ctx);
+        }
         if let Some(question) = question {
             self.confirm(extension_id, question.request_id, question.params, ctx);
         }
         became_initialized
+    }
+
+    /// Records the snapshot an extension published for one of its panels.
+    ///
+    /// The panel view reads this back at render time rather than being pushed
+    /// its own copy, so there is exactly one record of what a panel shows and
+    /// no way for the two to disagree.
+    fn set_panel_state(
+        &mut self,
+        extension_id: &str,
+        state: PanelViewState,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let panel_id = state.panel_id.clone();
+        self.panel_states
+            .insert((extension_id.to_owned(), panel_id.clone()), state);
+        ctx.emit(ExtensionManagerEvent::PanelStateChanged {
+            extension_id: extension_id.to_owned(),
+            panel_id,
+        });
+    }
+
+    /// What a contributed panel is currently showing, if it has said yet.
+    ///
+    /// `None` covers both a panel whose extension has not published anything
+    /// and one whose extension has stopped; the panel renders as loading in the
+    /// first case and disappears in the second, so the two never look alike.
+    pub fn panel_state(&self, extension_id: &str, panel_id: &str) -> Option<&PanelViewState> {
+        self.panel_states
+            .get(&(extension_id.to_owned(), panel_id.to_owned()))
+    }
+
+    /// Tells an extension that the user activated a row in one of its panels.
+    ///
+    /// Checked against the live contribution registry, exactly as an invoked
+    /// command is: a row rendered from a snapshot that outlived its extension
+    /// by a frame must not reach a plugin that is not there to answer, and a
+    /// panel id the extension never declared must not reach it at all.
+    pub fn invoke_panel_action(
+        &mut self,
+        extension_id: &str,
+        panel_id: &str,
+        section_id: &str,
+        item_id: &str,
+        action_id: &str,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if self.contributions.panel(extension_id, panel_id).is_none() {
+            return;
+        }
+        let origin = self.origin(ctx);
+        let event = match EventEnvelope::with_params(
+            EventKind::PanelAction,
+            &PanelActionParams {
+                panel_id: panel_id.to_owned(),
+                section_id: section_id.to_owned(),
+                item_id: item_id.to_owned(),
+                action_id: action_id.to_owned(),
+                origin,
+            },
+        ) {
+            Ok(event) => Message::Event(event),
+            Err(err) => {
+                log::warn!("Failed to encode {action_id} for extension {extension_id}: {err}");
+                return;
+            }
+        };
+        let Some(running) = self
+            .extensions
+            .get_mut(extension_id)
+            .and_then(|extension| extension.running.as_mut())
+        else {
+            return;
+        };
+        if let Err(err) = running.process.send(&event) {
+            log::warn!("Failed to deliver {action_id} to extension {extension_id}: {err}");
+        }
     }
 
     fn register_contributions(&mut self, extension_id: &str, ctx: &mut ModelContext<Self>) {

@@ -22,7 +22,7 @@ use crate::terminal::ShellLaunchData;
 use crate::themes::theme::AnsiColorIdentifier;
 use crate::workspace::WorkspaceRegistry;
 use crate::workspace::tab_group::TabGroupId;
-use crate::workspace::view::left_panel::ToolPanelView;
+use crate::workspace::view::tool_panel::ToolPanelView;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppState {
@@ -314,15 +314,30 @@ pub enum LeftPanelDisplayedTab {
     GlobalSearch,
     WarpDrive,
     ConversationListView,
+    /// A panel an extension contributed. Restoring it only shows the panel
+    /// again if that extension is running and still declares it; otherwise the
+    /// tools panel falls back to its first available panel, exactly as it does
+    /// for a built-in one a setting has switched off.
+    Extension {
+        extension_id: String,
+        panel_id: String,
+    },
 }
 
-impl From<ToolPanelView> for LeftPanelDisplayedTab {
-    fn from(view: ToolPanelView) -> Self {
+impl From<&ToolPanelView> for LeftPanelDisplayedTab {
+    fn from(view: &ToolPanelView) -> Self {
         match view {
             ToolPanelView::ProjectExplorer => LeftPanelDisplayedTab::FileTree,
             ToolPanelView::GlobalSearch { .. } => LeftPanelDisplayedTab::GlobalSearch,
             ToolPanelView::WarpDrive => LeftPanelDisplayedTab::WarpDrive,
             ToolPanelView::ConversationListView => LeftPanelDisplayedTab::ConversationListView,
+            ToolPanelView::Extension {
+                extension_id,
+                panel_id,
+            } => LeftPanelDisplayedTab::Extension {
+                extension_id: extension_id.clone(),
+                panel_id: panel_id.clone(),
+            },
         }
     }
 }

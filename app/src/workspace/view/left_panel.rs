@@ -1,8 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use warp_core::send_telemetry_from_ctx;
-use warp_core::ui::Icon;
 use warp_core::ui::theme::color::internal_colors;
 use warp_errors::report_error;
 use warp_util::path::LineAndColumnArg;
@@ -24,7 +23,6 @@ use crate::TelemetryEvent;
 use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::agent_conversations_model::AgentConversationsModel;
 use crate::appearance::Appearance;
-use crate::auth::AuthStateProvider;
 use crate::code::buffer_location::LocalOrRemotePath;
 #[cfg(feature = "local_fs")]
 use crate::code::file_tree::FileTreeEvent;
@@ -33,7 +31,6 @@ use crate::coding_panel_enablement_state::CodingPanelEnablementState;
 use crate::drive::panel::{
     DrivePanel, DrivePanelEvent, MAX_SIDEBAR_WIDTH_RATIO, MIN_SIDEBAR_WIDTH,
 };
-use crate::drive::settings::WarpDriveSettings;
 use crate::pane_group::pane::view::header::PANE_HEADER_HEIGHT;
 use crate::pane_group::pane::view::header::components::HEADER_EDGE_PADDING;
 use crate::pane_group::working_directories::WorkingDirectory;
@@ -43,7 +40,6 @@ use crate::pane_group::{
 #[cfg(feature = "local_fs")]
 use crate::server::telemetry::CodePanelsFileOpenEntrypoint;
 use crate::server::telemetry::{FileTreeSource, WarpDriveSource};
-use crate::settings::AISettings;
 use crate::settings_view::keybindings::{KeybindingChangedEvent, KeybindingChangedNotifier};
 use crate::terminal::resizable_data::{ModalType, ResizableData};
 use crate::ui_components::buttons::{icon_button, icon_button_with_color};
@@ -60,67 +56,47 @@ use crate::workspace::WorkspaceAction;
 use crate::workspace::view::conversation_list::view::{
     ConversationListView, Event as ConversationListViewEvent,
 };
+use crate::workspace::view::extension_panel::ExtensionPanelView;
 use crate::workspace::view::global_search::view::{
     Event as GlobalSearchViewEvent, GlobalSearchEntryFocus, GlobalSearchView,
 };
-use crate::workspace::view::{
-    LEFT_PANEL_AGENT_CONVERSATIONS_BINDING_NAME, LEFT_PANEL_GLOBAL_SEARCH_BINDING_NAME,
-    LEFT_PANEL_PROJECT_EXPLORER_BINDING_NAME, LEFT_PANEL_WARP_DRIVE_BINDING_NAME,
-    OPEN_GLOBAL_SEARCH_BINDING_NAME, TOGGLE_CONVERSATION_LIST_VIEW_BINDING_NAME,
-    TOGGLE_PROJECT_EXPLORER_BINDING_NAME, TOGGLE_WARP_DRIVE_BINDING_NAME,
-};
-
-#[derive(Default)]
-struct MouseStateHandles {
-    project_explorer_button: MouseStateHandle,
-    conversation_list_view_button: MouseStateHandle,
-    global_search_button: MouseStateHandle,
-    warp_drive_button: MouseStateHandle,
-    sign_in_button: MouseStateHandle,
-}
+use crate::workspace::view::tool_panel::{self, ToolPanel, ToolPanelAvailability, ToolPanelView};
 
 #[derive(Clone, Debug)]
 pub enum LeftPanelAction {
     ProjectExplorer,
-    GlobalSearch { entry_focus: GlobalSearchEntryFocus },
+    GlobalSearch {
+        entry_focus: GlobalSearchEntryFocus,
+    },
     WarpDrive,
     ConversationListView,
+    /// Show the panel a running extension contributed.
+    Extension {
+        extension_id: String,
+        panel_id: String,
+    },
     SignIn,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ToolPanelAvailability {
-    Available,
-    RequiresAccount,
-    RequiresAi,
-}
-
-impl ToolPanelView {
-    fn availability(self, app: &AppContext) -> ToolPanelAvailability {
-        match self {
-            ToolPanelView::ProjectExplorer | ToolPanelView::GlobalSearch { .. } => {
-                ToolPanelAvailability::Available
-            }
-            ToolPanelView::WarpDrive => {
-                if WarpDriveSettings::is_warp_drive_available(app) {
-                    ToolPanelAvailability::Available
-                } else {
-                    ToolPanelAvailability::RequiresAccount
-                }
-            }
-            ToolPanelView::ConversationListView => {
-                if AuthStateProvider::as_ref(app)
-                    .get()
-                    .is_anonymous_or_logged_out()
-                {
-                    ToolPanelAvailability::RequiresAccount
-                } else if AISettings::as_ref(app).is_conversation_history_available(app) {
-                    ToolPanelAvailability::Available
-                } else {
-                    ToolPanelAvailability::RequiresAi
-                }
-            }
-        }
+impl LeftPanelAction {
+    /// The panel this action selects, if it selects one.
+    fn view(&self) -> Option<ToolPanelView> {
+        Some(match self {
+            LeftPanelAction::ProjectExplorer => ToolPanelView::ProjectExplorer,
+            LeftPanelAction::GlobalSearch { entry_focus } => ToolPanelView::GlobalSearch {
+                entry_focus: *entry_focus,
+            },
+            LeftPanelAction::WarpDrive => ToolPanelView::WarpDrive,
+            LeftPanelAction::ConversationListView => ToolPanelView::ConversationListView,
+            LeftPanelAction::Extension {
+                extension_id,
+                panel_id,
+            } => ToolPanelView::Extension {
+                extension_id: extension_id.clone(),
+                panel_id: panel_id.clone(),
+            },
+            LeftPanelAction::SignIn => return None,
+        })
     }
 }
 
@@ -144,14 +120,6 @@ pub enum LeftPanelEvent {
     SignInRequested,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ToolPanelView {
-    ProjectExplorer,
-    GlobalSearch { entry_focus: GlobalSearchEntryFocus },
-    WarpDrive,
-    ConversationListView,
-}
-
 /// Encapsulates the active view state to enforce that all mutations go through
 /// `active_view_state::set`, which handles necessary side effects.
 mod active_view_state {
@@ -162,8 +130,8 @@ mod active_view_state {
     pub struct ActiveViewState(ToolPanelView);
 
     impl ActiveViewState {
-        pub fn get(&self) -> ToolPanelView {
-            self.0
+        pub fn get(&self) -> &ToolPanelView {
+            &self.0
         }
     }
 
@@ -176,13 +144,13 @@ mod active_view_state {
         new_view: ToolPanelView,
         ctx: &mut ViewContext<super::LeftPanelView>,
     ) {
-        let previous = left_panel.active_view.0;
-        left_panel.active_view.0 = new_view;
+        let previous = std::mem::replace(&mut left_panel.active_view.0, new_view);
         left_panel.update_button_active_states();
         ctx.notify();
 
         let was_conversation_list_open = previous == ToolPanelView::ConversationListView;
-        let is_conversation_list_open = new_view == ToolPanelView::ConversationListView;
+        let is_conversation_list_open =
+            left_panel.active_view.0 == ToolPanelView::ConversationListView;
         if was_conversation_list_open && !is_conversation_list_open {
             left_panel.on_conversation_list_view_visibility_changed(false, ctx);
         } else if !was_conversation_list_open && is_conversation_list_open {
@@ -209,14 +177,24 @@ pub struct ToolbeltButtonConfig {
     ///
     /// This is updated in response to [`KeybindingChangedEvent`]s.
     pub tooltip_keybinding: Option<String>,
+    /// Hover state, owned by the button rather than by the view.
+    ///
+    /// The toolbelt is as long as the registry says, so there is no fixed set
+    /// of handles to line up against it; one that lived beside the view would
+    /// go to the wrong button the moment a panel appeared or went away.
+    pub mouse_state: MouseStateHandle,
 }
 
 pub struct LeftPanelView {
     resizable_state_handle: ResizableStateHandle,
-    mouse_state_handles: MouseStateHandles,
+    sign_in_button_mouse_state: MouseStateHandle,
     close_button_mouse_state: MouseStateHandle,
     warp_drive_view: ViewHandle<DrivePanel>,
     conversation_list_view: ViewHandle<ConversationListView>,
+    /// One view per contributed panel, created the first time the panel is
+    /// listed and dropped when it stops being listed, so a stopped extension
+    /// leaves nothing behind.
+    extension_panel_views: HashMap<(String, String), ViewHandle<ExtensionPanelView>>,
     active_view: active_view_state::ActiveViewState,
     toolbelt_buttons: Vec<ToolbeltButtonConfig>,
     active_pane_group: Option<WeakViewHandle<PaneGroup>>,
@@ -250,7 +228,7 @@ impl LeftPanelView {
     fn render_unavailable_panel(
         &self,
         appearance: &Appearance,
-        view: ToolPanelView,
+        view: &ToolPanelView,
         availability: ToolPanelAvailability,
     ) -> Box<dyn Element> {
         let (title, description) = match (view, availability) {
@@ -269,11 +247,14 @@ impl LeftPanelView {
             (
                 ToolPanelView::ProjectExplorer
                 | ToolPanelView::GlobalSearch { .. }
-                | ToolPanelView::WarpDrive,
+                | ToolPanelView::WarpDrive
+                | ToolPanelView::Extension { .. },
                 ToolPanelAvailability::RequiresAi,
             )
             | (
-                ToolPanelView::ProjectExplorer | ToolPanelView::GlobalSearch { .. },
+                ToolPanelView::ProjectExplorer
+                | ToolPanelView::GlobalSearch { .. }
+                | ToolPanelView::Extension { .. },
                 ToolPanelAvailability::RequiresAccount,
             )
             | (_, ToolPanelAvailability::Available) => {
@@ -318,7 +299,7 @@ impl LeftPanelView {
                 .ui_builder()
                 .button(
                     ButtonVariant::Accent,
-                    self.mouse_state_handles.sign_in_button.clone(),
+                    self.sign_in_button_mouse_state.clone(),
                 )
                 .with_text_label("Sign in".to_string())
                 .build()
@@ -336,7 +317,7 @@ impl LeftPanelView {
     }
     pub fn new(
         working_directories_model: ModelHandle<WorkingDirectoriesModel>,
-        views: Vec<ToolPanelView>,
+        panels: Vec<ToolPanel>,
         ctx: &mut ViewContext<Self>,
     ) -> Self {
         let resizable_data_handle = ResizableData::handle(ctx);
@@ -374,10 +355,13 @@ impl LeftPanelView {
             }
         });
 
-        let active_view = views.first().copied().unwrap_or(ToolPanelView::WarpDrive);
-        let toolbelt_buttons = views
+        let active_view = panels
+            .first()
+            .map(|panel| panel.view.clone())
+            .unwrap_or(ToolPanelView::WarpDrive);
+        let toolbelt_buttons = panels
             .iter()
-            .map(|view| Self::create_toolbelt_button_config(view, ctx))
+            .map(|panel| Self::create_toolbelt_button_config(panel, ctx))
             .collect();
 
         ctx.subscribe_to_model(
@@ -463,10 +447,11 @@ impl LeftPanelView {
 
         let mut view = Self {
             resizable_state_handle,
-            mouse_state_handles: Default::default(),
+            sign_in_button_mouse_state: Default::default(),
             close_button_mouse_state: Default::default(),
             warp_drive_view,
             conversation_list_view,
+            extension_panel_views: HashMap::new(),
             active_view: active_view_state::new(active_view),
             toolbelt_buttons,
             active_pane_group: None,
@@ -474,6 +459,7 @@ impl LeftPanelView {
             is_agent_management_view_open: false,
             panel_position: super::PanelPosition::Left,
         };
+        view.reconcile_extension_panel_views(&panels, ctx);
         view.update_button_active_states();
 
         view
@@ -493,32 +479,21 @@ impl LeftPanelView {
         ctx.notify();
     }
 
-    /// Updates the available tool panel views.
-    /// If the currently active view is no longer available, switches to the first available view.
-    pub fn update_available_views(
-        &mut self,
-        views: Vec<ToolPanelView>,
-        ctx: &mut ViewContext<Self>,
-    ) {
-        // Check if the current active view is still available
-        let current_view = self.active_view.get();
-        let is_current_view_available = views.iter().any(|v| {
-            // Use discriminant comparison for GlobalSearch since it has inner data
-            match (v, &current_view) {
-                (ToolPanelView::GlobalSearch { .. }, ToolPanelView::GlobalSearch { .. }) => true,
-                _ => std::mem::discriminant(v) == std::mem::discriminant(&current_view),
-            }
-        });
+    /// Updates the available tool panels.
+    /// If the currently active panel is no longer available, switches to the first available one.
+    pub fn update_available_views(&mut self, panels: Vec<ToolPanel>, ctx: &mut ViewContext<Self>) {
+        let is_current_view_available = tool_panel::lists(&panels, self.active_view.get());
 
         // Rebuild toolbelt buttons
-        self.toolbelt_buttons = views
+        self.toolbelt_buttons = panels
             .iter()
-            .map(|view| Self::create_toolbelt_button_config(view, ctx))
+            .map(|panel| Self::create_toolbelt_button_config(panel, ctx))
             .collect();
+        self.reconcile_extension_panel_views(&panels, ctx);
 
         // If current view is no longer available, switch to the first available view
         if !is_current_view_available {
-            if let Some(first_view) = views.first().copied() {
+            if let Some(first_view) = panels.first().map(|panel| panel.view.clone()) {
                 active_view_state::set(self, first_view, ctx);
             }
         } else {
@@ -539,76 +514,52 @@ impl LeftPanelView {
     }
 
     fn create_toolbelt_button_config(
-        view: &ToolPanelView,
+        panel: &ToolPanel,
         ctx: &ViewContext<Self>,
     ) -> ToolbeltButtonConfig {
-        match view {
-            ToolPanelView::ProjectExplorer => {
-                let tooltip_keybinding_names = vec![
-                    LEFT_PANEL_PROJECT_EXPLORER_BINDING_NAME,
-                    TOGGLE_PROJECT_EXPLORER_BINDING_NAME,
-                ];
+        ToolbeltButtonConfig {
+            icon: panel.icon,
+            active_icon: panel.active_icon,
+            tooltip_text: panel.title.clone(),
+            action: action_for(&panel.view),
+            render_with_active_state: false,
+            tooltip_keybinding: toolbelt_tooltip_keybinding(&panel.tooltip_keybinding_names, ctx),
+            tooltip_keybinding_names: panel.tooltip_keybinding_names.clone(),
+            mouse_state: MouseStateHandle::default(),
+        }
+    }
 
-                ToolbeltButtonConfig {
-                    icon: Icon::FileCopy,
-                    active_icon: None,
-                    tooltip_text: "Project explorer".to_string(),
-                    action: LeftPanelAction::ProjectExplorer,
-                    render_with_active_state: false,
-                    tooltip_keybinding: toolbelt_tooltip_keybinding(&tooltip_keybinding_names, ctx),
-                    tooltip_keybinding_names,
-                }
-            }
-            ToolPanelView::GlobalSearch { .. } => {
-                let tooltip_keybinding_names = vec![
-                    LEFT_PANEL_GLOBAL_SEARCH_BINDING_NAME,
-                    OPEN_GLOBAL_SEARCH_BINDING_NAME,
-                ];
-
-                ToolbeltButtonConfig {
-                    icon: Icon::Search,
-                    active_icon: None,
-                    tooltip_text: "Global search".to_string(),
-                    action: LeftPanelAction::GlobalSearch {
-                        entry_focus: GlobalSearchEntryFocus::QueryEditor,
-                    },
-                    render_with_active_state: false,
-                    tooltip_keybinding: toolbelt_tooltip_keybinding(&tooltip_keybinding_names, ctx),
-                    tooltip_keybinding_names,
-                }
-            }
-            ToolPanelView::WarpDrive => {
-                let tooltip_keybinding_names = vec![
-                    LEFT_PANEL_WARP_DRIVE_BINDING_NAME,
-                    TOGGLE_WARP_DRIVE_BINDING_NAME,
-                ];
-
-                ToolbeltButtonConfig {
-                    icon: Icon::WarpDrive,
-                    active_icon: None,
-                    tooltip_text: "Warp Drive".to_string(),
-                    action: LeftPanelAction::WarpDrive,
-                    render_with_active_state: false,
-                    tooltip_keybinding: toolbelt_tooltip_keybinding(&tooltip_keybinding_names, ctx),
-                    tooltip_keybinding_names,
-                }
-            }
-            ToolPanelView::ConversationListView => {
-                let tooltip_keybinding_names = vec![
-                    LEFT_PANEL_AGENT_CONVERSATIONS_BINDING_NAME,
-                    TOGGLE_CONVERSATION_LIST_VIEW_BINDING_NAME,
-                ];
-
-                ToolbeltButtonConfig {
-                    icon: Icon::Conversation,
-                    active_icon: Some(Icon::Conversation),
-                    tooltip_text: "Agent conversations".to_string(),
-                    action: LeftPanelAction::ConversationListView,
-                    render_with_active_state: false,
-                    tooltip_keybinding: toolbelt_tooltip_keybinding(&tooltip_keybinding_names, ctx),
-                    tooltip_keybinding_names,
-                }
-            }
+    /// Creates a view for every contributed panel now listed, and drops the
+    /// ones that are not.
+    ///
+    /// A panel disappears when its extension stops, and its view holds a
+    /// subscription to the manager; keeping it would leave a view rebuilding
+    /// rows for a snapshot nobody is publishing any more.
+    fn reconcile_extension_panel_views(
+        &mut self,
+        panels: &[ToolPanel],
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let listed: HashSet<(String, String)> = panels
+            .iter()
+            .filter_map(|panel| match &panel.view {
+                ToolPanelView::Extension {
+                    extension_id,
+                    panel_id,
+                } => Some((extension_id.clone(), panel_id.clone())),
+                _ => None,
+            })
+            .collect();
+        self.extension_panel_views
+            .retain(|key, _| listed.contains(key));
+        for (extension_id, panel_id) in listed {
+            self.extension_panel_views
+                .entry((extension_id.clone(), panel_id.clone()))
+                .or_insert_with(|| {
+                    ctx.add_typed_action_view(|ctx| {
+                        ExtensionPanelView::new(extension_id.clone(), panel_id.clone(), ctx)
+                    })
+                });
         }
     }
 
@@ -690,16 +641,16 @@ impl LeftPanelView {
             .get_file_tree_view(pane_group_id)
     }
 
-    pub fn active_view(&self) -> ToolPanelView {
+    pub fn active_view(&self) -> &ToolPanelView {
         self.active_view.get()
     }
 
     pub fn is_warp_drive_active(&self) -> bool {
-        self.active_view.get() == ToolPanelView::WarpDrive
+        *self.active_view.get() == ToolPanelView::WarpDrive
     }
 
     pub fn is_file_tree_active(&self) -> bool {
-        self.active_view.get() == ToolPanelView::ProjectExplorer
+        *self.active_view.get() == ToolPanelView::ProjectExplorer
     }
 
     pub fn warp_drive_view(&self) -> &ViewHandle<DrivePanel> {
@@ -838,7 +789,7 @@ impl LeftPanelView {
             ctx.focus_self();
             return;
         }
-        match self.active_view.get() {
+        match self.active_view.get().clone() {
             ToolPanelView::ProjectExplorer => {
                 if let Some(file_tree_view) = self.active_file_tree_view(ctx) {
                     file_tree_view.update(ctx, |view, ctx| {
@@ -872,6 +823,15 @@ impl LeftPanelView {
                 self.conversation_list_view.update(ctx, |view, ctx| {
                     view.on_left_panel_focused(ctx);
                 });
+            }
+            ToolPanelView::Extension {
+                extension_id,
+                panel_id,
+            } => {
+                if let Some(view) = self.extension_panel_views.get(&(extension_id, panel_id)) {
+                    let view = view.clone();
+                    ctx.focus(&view);
+                }
             }
         }
     }
@@ -1027,28 +987,20 @@ impl LeftPanelView {
     }
 
     fn update_button_active_states(&mut self) {
+        let active = self.active_view.get();
         for button in &mut self.toolbelt_buttons {
-            button.render_with_active_state = match &button.action {
-                LeftPanelAction::ProjectExplorer => {
-                    self.active_view.get() == ToolPanelView::ProjectExplorer
-                }
-                LeftPanelAction::GlobalSearch { .. } => {
-                    matches!(self.active_view.get(), ToolPanelView::GlobalSearch { .. })
-                }
-                LeftPanelAction::WarpDrive => self.active_view.get() == ToolPanelView::WarpDrive,
-                LeftPanelAction::ConversationListView => {
-                    self.active_view.get() == ToolPanelView::ConversationListView
-                }
-                LeftPanelAction::SignIn => false,
-            };
+            button.render_with_active_state = button
+                .action
+                .view()
+                .is_some_and(|view| view.is_same_panel(active));
         }
     }
 
     fn render_button(
         button_config: &ToolbeltButtonConfig,
-        mouse_state: MouseStateHandle,
         appearance: &Appearance,
     ) -> Box<dyn Element> {
+        let mouse_state = button_config.mouse_state.clone();
         let action = button_config.action.clone();
         let ui_builder = appearance.ui_builder().clone();
         let tooltip_keybinding = button_config.tooltip_keybinding.clone();
@@ -1142,7 +1094,7 @@ impl LeftPanelView {
                 }
             }
             LeftPanelAction::GlobalSearch { entry_focus } => {
-                let was_active = self.active_view.get()
+                let was_active = *self.active_view.get()
                     == ToolPanelView::GlobalSearch {
                         entry_focus: *entry_focus,
                     };
@@ -1185,6 +1137,22 @@ impl LeftPanelView {
                     send_telemetry_from_ctx!(TelemetryEvent::ConversationListViewOpened, ctx);
                 }
             }
+            // No telemetry event: Warp does not have one per contributed
+            // panel, and inventing a shared one that names the extension would
+            // report what the user installed rather than what they did.
+            LeftPanelAction::Extension {
+                extension_id,
+                panel_id,
+            } => {
+                active_view_state::set(
+                    self,
+                    ToolPanelView::Extension {
+                        extension_id: extension_id.clone(),
+                        panel_id: panel_id.clone(),
+                    },
+                    ctx,
+                );
+            }
             LeftPanelAction::SignIn => {
                 ctx.emit(LeftPanelEvent::SignInRequested);
             }
@@ -1192,7 +1160,7 @@ impl LeftPanelView {
     }
 
     pub fn on_left_panel_visibility_changed(&self, is_now_open: bool, ctx: &mut ViewContext<Self>) {
-        if ToolPanelView::ConversationListView == self.active_view.get() {
+        if ToolPanelView::ConversationListView == *self.active_view.get() {
             self.on_conversation_list_view_visibility_changed(is_now_open, ctx);
         }
 
@@ -1225,7 +1193,7 @@ impl LeftPanelView {
         };
 
         let is_visible = active_pane_group.as_ref(ctx).left_panel_open
-            && self.active_view.get() == ToolPanelView::ProjectExplorer;
+            && *self.active_view.get() == ToolPanelView::ProjectExplorer;
 
         if let Some(file_tree_view) = self
             .working_directories_model
@@ -1246,7 +1214,7 @@ impl LeftPanelView {
         is_now_open: bool,
         ctx: &mut ViewContext<Self>,
     ) {
-        let is_available = self.active_view.get() == ToolPanelView::ConversationListView
+        let is_available = *self.active_view.get() == ToolPanelView::ConversationListView
             && self.active_view_availability(ctx) == ToolPanelAvailability::Available;
         let window_id = ctx.window_id();
         let view_id = self.conversation_list_view.id();
@@ -1278,7 +1246,7 @@ impl View for LeftPanelView {
         if focus_ctx.is_self_focused()
             && self.active_view_availability(ctx) == ToolPanelAvailability::Available
         {
-            match self.active_view.get() {
+            match self.active_view.get().clone() {
                 ToolPanelView::ProjectExplorer => {
                     if let Some(view) = self.active_file_tree_view(ctx) {
                         ctx.focus(&view);
@@ -1291,21 +1259,21 @@ impl View for LeftPanelView {
                 }
                 ToolPanelView::WarpDrive => ctx.focus(&self.warp_drive_view),
                 ToolPanelView::ConversationListView => ctx.focus(&self.conversation_list_view),
+                ToolPanelView::Extension {
+                    extension_id,
+                    panel_id,
+                } => {
+                    if let Some(view) = self.extension_panel_views.get(&(extension_id, panel_id)) {
+                        let view = view.clone();
+                        ctx.focus(&view);
+                    }
+                }
             }
         }
     }
 
     fn render(&self, app: &AppContext) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);
-
-        let mouse_state_handles = vec![
-            self.mouse_state_handles.project_explorer_button.clone(),
-            self.mouse_state_handles
-                .conversation_list_view_button
-                .clone(),
-            self.mouse_state_handles.global_search_button.clone(),
-            self.mouse_state_handles.warp_drive_button.clone(),
-        ];
 
         // If there is only one button in the toolbelt row,
         // there is no need to show it as it's a bit redundant.
@@ -1314,11 +1282,11 @@ impl View for LeftPanelView {
                 Flex::row()
                     .with_cross_axis_alignment(CrossAxisAlignment::Center)
                     .with_spacing(4.0)
-                    .with_children(self.toolbelt_buttons.iter().zip(&mouse_state_handles).map(
-                        |(button_config, mouse_state)| {
-                            Self::render_button(button_config, mouse_state.clone(), appearance)
-                        },
-                    ))
+                    .with_children(
+                        self.toolbelt_buttons
+                            .iter()
+                            .map(|button_config| Self::render_button(button_config, appearance)),
+                    )
                     .with_main_axis_size(MainAxisSize::Min)
                     .finish(),
             )
@@ -1369,6 +1337,26 @@ impl View for LeftPanelView {
                     Shrinkable::new(1.0, ChildView::new(&self.conversation_list_view).finish())
                         .finish()
                 }
+                ToolPanelView::Extension {
+                    extension_id,
+                    panel_id,
+                } => match self
+                    .extension_panel_views
+                    .get(&(extension_id.clone(), panel_id.clone()))
+                {
+                    Some(panel_view) => Shrinkable::new(
+                        1.0,
+                        Container::new(ChildView::new(panel_view).finish())
+                            .with_padding_left(2.)
+                            .with_padding_right(2.)
+                            .finish(),
+                    )
+                    .finish(),
+                    // The button and the view are reconciled together, so this
+                    // is only reachable for the frame between the two.
+                    None => Shrinkable::new(1.0, Container::new(Empty::new().finish()).finish())
+                        .finish(),
+                },
             }
         };
 
@@ -1425,6 +1413,28 @@ impl View for LeftPanelView {
                 (min_width, max_width.max(min_width))
             }))
             .finish()
+    }
+}
+
+/// The action that selects a panel from the toolbelt.
+fn action_for(view: &ToolPanelView) -> LeftPanelAction {
+    match view {
+        ToolPanelView::ProjectExplorer => LeftPanelAction::ProjectExplorer,
+        // Selecting global search from the toolbelt starts in the query
+        // editor, whatever the registry's own entry focus is: the user came to
+        // type, not to read the previous result set.
+        ToolPanelView::GlobalSearch { .. } => LeftPanelAction::GlobalSearch {
+            entry_focus: GlobalSearchEntryFocus::QueryEditor,
+        },
+        ToolPanelView::WarpDrive => LeftPanelAction::WarpDrive,
+        ToolPanelView::ConversationListView => LeftPanelAction::ConversationListView,
+        ToolPanelView::Extension {
+            extension_id,
+            panel_id,
+        } => LeftPanelAction::Extension {
+            extension_id: extension_id.clone(),
+            panel_id: panel_id.clone(),
+        },
     }
 }
 

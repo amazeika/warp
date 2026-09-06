@@ -6,6 +6,7 @@ pub(crate) mod codex_modal;
 pub mod conversation_list;
 #[cfg(enable_crash_recovery)]
 mod crash_recovery;
+pub(crate) mod extension_panel;
 pub(crate) mod feature_intro_modal;
 pub(crate) mod free_ai_removal_modal;
 pub mod global_search;
@@ -20,6 +21,7 @@ mod tab_grouping;
 #[cfg(test)]
 #[path = "view_tests.rs"]
 pub(crate) mod tests;
+pub(crate) mod tool_panel;
 mod vertical_tabs;
 #[cfg(target_family = "wasm")]
 mod wasm_view;
@@ -283,6 +285,7 @@ use crate::editor::{
 use crate::env_vars::CloudEnvVarCollection;
 use crate::env_vars::manager::{EnvVarCollectionManager, EnvVarCollectionSource};
 use crate::experiments::{BlockOnboarding, Experiment};
+use crate::extensions::{ExtensionManager, ExtensionManagerEvent};
 use crate::launch_configs::launch_config::WindowTemplate;
 use crate::launch_configs::save_modal::{LaunchConfigModalEvent, LaunchConfigSaveModal};
 use crate::menu::{
@@ -528,9 +531,7 @@ use crate::workspace::view::free_ai_removal_modal::{
 };
 use crate::workspace::view::global_search::view::GlobalSearchEntryFocus;
 use crate::workspace::view::launch_modal::{LaunchModal, LaunchModalEvent, OzLaunchSlide};
-use crate::workspace::view::left_panel::{
-    LeftPanelAction, LeftPanelEvent, LeftPanelView, ToolPanelView,
-};
+use crate::workspace::view::left_panel::{LeftPanelAction, LeftPanelEvent, LeftPanelView};
 use crate::workspace::view::openwarp_launch_modal::{
     OpenWarpLaunchModal, OpenWarpLaunchModalEvent,
 };
@@ -538,6 +539,7 @@ use crate::workspace::view::orchestration_launch_modal::{
     OrchestrationLaunchModal, OrchestrationLaunchModalEvent,
 };
 use crate::workspace::view::right_panel::{RightPanelEvent, RightPanelView};
+use crate::workspace::view::tool_panel::{ToolPanel, ToolPanelView};
 use crate::workspace::{ForkFromExchange, ForkedConversationDestination};
 use crate::workspaces::update_manager::TeamUpdateManager;
 use crate::workspaces::user_workspaces::{ResolvedTeamScope, UserWorkspaces};
@@ -1168,7 +1170,8 @@ pub struct Workspace {
     vertical_tabs_panel_open: bool,
     vertical_tabs_panel: VerticalTabsPanelState,
     left_panel_view: ViewHandle<LeftPanelView>,
-    left_panel_views: Vec<ToolPanelView>,
+    /// Everything the tools panel can currently show, from the panel registry.
+    left_panel_views: Vec<ToolPanel>,
     right_panel_view: ViewHandle<RightPanelView>,
     working_directories_model: ModelHandle<pane_group::WorkingDirectoriesModel>,
     agent_management_view: ViewHandle<AgentManagementView>,
@@ -3084,7 +3087,7 @@ impl Workspace {
         let working_directories_model =
             ctx.add_model(|_| pane_group::WorkingDirectoriesModel::new());
 
-        let left_panel_views = Self::compute_left_panel_views(ctx);
+        let left_panel_views = tool_panel::available(ctx);
 
         let left_panel_view = ctx.add_typed_action_view(|ctx| {
             LeftPanelView::new(
@@ -3097,6 +3100,19 @@ impl Workspace {
         ctx.subscribe_to_view(&left_panel_view, |me, _, event, ctx| {
             me.handle_left_panel_event(event, ctx);
         });
+
+        // A contributed panel appears and disappears with its extension, so the
+        // toolbelt is rebuilt when the registry changes rather than polled.
+        // Only registered when the feature is on: asking for a singleton that
+        // was never registered panics.
+        if ctx.has_singleton_model::<ExtensionManager>() {
+            let extensions = ExtensionManager::handle(&*ctx);
+            ctx.subscribe_to_model(&extensions, |me, _, event, ctx| {
+                if matches!(event, ExtensionManagerEvent::ContributionsChanged) {
+                    me.update_left_panel_available_views(ctx);
+                }
+            });
+        }
 
         let right_panel_view = ctx.add_typed_action_view(|ctx| {
             RightPanelView::new(working_directories_model.clone(), ctx)
@@ -4236,13 +4252,20 @@ impl Workspace {
 
         self.left_panel_view.update(ctx, |lp, ctx| {
             // Restore which panel tab was active
-            let active_view = match left_panel_snapshot.left_panel_displayed_tab {
+            let active_view = match &left_panel_snapshot.left_panel_displayed_tab {
                 LeftPanelDisplayedTab::FileTree => ToolPanelView::ProjectExplorer,
                 LeftPanelDisplayedTab::GlobalSearch => ToolPanelView::GlobalSearch {
                     entry_focus: GlobalSearchEntryFocus::Results,
                 },
                 LeftPanelDisplayedTab::WarpDrive => ToolPanelView::WarpDrive,
                 LeftPanelDisplayedTab::ConversationListView => ToolPanelView::ConversationListView,
+                LeftPanelDisplayedTab::Extension {
+                    extension_id,
+                    panel_id,
+                } => ToolPanelView::Extension {
+                    extension_id: extension_id.clone(),
+                    panel_id: panel_id.clone(),
+                },
             };
             lp.restore_active_view_from_snapshot(active_view, ctx);
             lp.set_active_pane_group(pane_group.clone(), &self.working_directories_model, ctx);
@@ -20474,21 +20497,9 @@ impl Workspace {
                     "workspace:toggle_vertical_tabs_panel",
                 )
             } else {
-                let tooltip = if self.left_panel_views.len() <= 1 {
-                    match self
-                        .left_panel_views
-                        .first()
-                        .copied()
-                        .unwrap_or(ToolPanelView::WarpDrive)
-                    {
-                        ToolPanelView::ProjectExplorer => "Project explorer",
-                        ToolPanelView::GlobalSearch { .. } => "Global search",
-                        ToolPanelView::WarpDrive => "Warp Drive",
-                        ToolPanelView::ConversationListView => "Agent conversations",
-                    }
-                } else {
-                    "Tools panel"
-                };
+                // With one panel the button opens that panel, so it is named;
+                // with several it opens the panel that holds them all.
+                let tooltip = tool_panel::single_panel_title(&self.left_panel_views);
                 (
                     self.active_tab_pane_group().as_ref(ctx).left_panel_open,
                     tooltip,
@@ -20528,21 +20539,7 @@ impl Workspace {
     ) -> Box<dyn Element> {
         let is_active = self.active_tab_pane_group().as_ref(ctx).left_panel_open;
 
-        let tooltip_text = if self.left_panel_views.len() <= 1 {
-            match self
-                .left_panel_views
-                .first()
-                .copied()
-                .unwrap_or(ToolPanelView::WarpDrive)
-            {
-                ToolPanelView::ProjectExplorer => "Project explorer",
-                ToolPanelView::GlobalSearch { .. } => "Global search",
-                ToolPanelView::WarpDrive => "Warp Drive",
-                ToolPanelView::ConversationListView => "Agent conversations",
-            }
-        } else {
-            "Tools panel"
-        };
+        let tooltip_text = tool_panel::single_panel_title(&self.left_panel_views);
 
         SavePosition::new(
             Container::new(
@@ -23738,38 +23735,13 @@ impl Workspace {
         }
     }
 
-    /// Computes the list of available left panel views based on current AI settings and feature flags.
-    fn compute_left_panel_views(ctx: &AppContext) -> Vec<ToolPanelView> {
-        let mut views = vec![];
-        if cfg!(feature = "local_fs") && *CodeSettings::as_ref(ctx).show_project_explorer.value() {
-            views.push(ToolPanelView::ProjectExplorer);
-        }
-        if FeatureFlag::AgentViewConversationListView.is_enabled()
-            && *AISettings::as_ref(ctx).show_conversation_history
-        {
-            views.push(ToolPanelView::ConversationListView);
-        }
-        if cfg!(feature = "local_fs")
-            && FeatureFlag::GlobalSearch.is_enabled()
-            && *CodeSettings::as_ref(ctx).show_global_search.value()
-        {
-            views.push(ToolPanelView::GlobalSearch {
-                entry_focus: GlobalSearchEntryFocus::Results,
-            });
-        }
-        if *WarpDriveSettings::as_ref(ctx).enable_warp_drive {
-            views.push(ToolPanelView::WarpDrive);
-        }
-        views
-    }
-
-    /// Recomputes the available left panel views based on current AI settings and feature flags,
-    /// then updates both the workspace's left_panel_views and the LeftPanelView's toolbelt buttons.
+    /// Re-reads the panel registry, then updates both the workspace's
+    /// `left_panel_views` and the `LeftPanelView`'s toolbelt buttons.
     fn update_left_panel_available_views(&mut self, ctx: &mut ViewContext<Self>) {
-        let views = Self::compute_left_panel_views(ctx);
-        self.left_panel_views = views.clone();
+        let panels = tool_panel::available(ctx);
+        self.left_panel_views = panels.clone();
         self.left_panel_view.update(ctx, |left_panel, ctx| {
-            left_panel.update_available_views(views, ctx);
+            left_panel.update_available_views(panels, ctx);
         });
     }
 
@@ -26075,7 +26047,7 @@ impl TypedActionView for Workspace {
             }
             ToggleProjectExplorer => {
                 if *CodeSettings::as_ref(ctx).show_project_explorer {
-                    let is_showing = self.left_panel_view.as_ref(ctx).active_view()
+                    let is_showing = *self.left_panel_view.as_ref(ctx).active_view()
                         == ToolPanelView::ProjectExplorer;
                     self.toggle_left_panel_view(&LeftPanelAction::ProjectExplorer, is_showing, ctx);
                 }
@@ -26088,7 +26060,7 @@ impl TypedActionView for Workspace {
             ToggleWarpDrive => {
                 if WarpDriveSettings::is_warp_drive_enabled(ctx) {
                     let is_showing =
-                        self.left_panel_view.as_ref(ctx).active_view() == ToolPanelView::WarpDrive;
+                        *self.left_panel_view.as_ref(ctx).active_view() == ToolPanelView::WarpDrive;
                     self.toggle_left_panel_view(&LeftPanelAction::WarpDrive, is_showing, ctx);
                 }
             }
@@ -26140,7 +26112,7 @@ impl TypedActionView for Workspace {
             }
             ToggleConversationListView => {
                 if FeatureFlag::AgentViewConversationListView.is_enabled() {
-                    let is_showing = self.left_panel_view.as_ref(ctx).active_view()
+                    let is_showing = *self.left_panel_view.as_ref(ctx).active_view()
                         == ToolPanelView::ConversationListView;
                     self.toggle_left_panel_view(
                         &LeftPanelAction::ConversationListView,

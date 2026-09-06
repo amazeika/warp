@@ -369,6 +369,54 @@ The permission prompt, the palette entries for contributed commands, and
   left unset rather than guessed, because naming the wrong target is how a
   remote action lands on a local path.
 
+### 6b. The panel API _(PR 4)_
+
+The closed `ToolPanelView` enum becomes a registry
+(`app/src/workspace/view/tool_panel.rs`) of built-in variants plus the panels
+running extensions contribute, and `app/src/workspace/view/extension_panel.rs`
+draws a `PanelViewState` with Warp's own components. This is the largest core
+refactor in the sequence, which is why panels are their own PR.
+
+- **The registry is what makes extensions not a special case.** A built-in
+  panel switched off by a setting and a contributed panel whose extension
+  stopped disappear by the same mechanism — they stop being returned — so
+  neither can leave a toolbelt button that opens nothing. The registry also
+  removed the two duplicated four-arm matches that named the panel behind the
+  single-panel toggle button, and the fixed array of four hover handles the
+  toolbelt zipped against a variable-length button list.
+
+- **The snapshot lives in the manager, not in the view.** `panel.setState`
+  stores the latest `PanelViewState` per extension and panel; the panel view
+  reads it when it rebuilds its rows. One record means the two cannot disagree,
+  and dropping an extension's snapshots when it stops is what keeps a panel
+  from showing a repository state nothing is maintaining any more.
+
+- **A row is identified by its section and the path to it.** Item ids are only
+  unique within a section — the same path staged and unstaged is the obvious
+  case — and a child's id only under its parent, so nothing shorter identifies
+  the row an action came from.
+
+- **Clicking a leaf runs its first action; a row with children expands.** The
+  plugin already orders the actions it renders, so the first one is the
+  primary. A parent row's actions stay in the overflow menu rather than firing
+  when the user meant to look inside it. What the user expands or collapses
+  outranks the plugin's own `expanded`, so a redraw does not undo a click.
+
+- **Warp owns the icon set.** A plugin names an intent from a fixed vocabulary
+  and Warp picks the glyph, so an extension cannot borrow the appearance of a
+  surface it is not. A name outside the vocabulary renders without an icon
+  rather than with a placeholder: a wrong icon says something false about the
+  row, a missing one says nothing. Loading, empty and error presentation stay
+  Warp's for the same reason, and a destructive action is styled by Warp rather
+  than by the extension that declared it.
+
+- **`PanelLocation::Right` has no host in v0.1.** Warp's right panel is the code
+  review pane, not a second tools panel. A `right` contribution is reported when
+  the extension registers rather than quietly moved to the side the manifest did
+  not ask for.
+
+- **Capabilities.** This PR adds `panel.tree.v1`.
+
 ### 7. Internal services the adapters need _(PR 5–6)_
 
 - **`ExecutionService`** — resolves `ExecutionTarget::Local` to a spawned
@@ -397,12 +445,6 @@ The permission prompt, the palette entries for contributed commands, and
   workspace, the active pane's `WorkingDirectory`, `repo_metadata`, and the
   session's local/remote identity, and emits the context events.
 
-- **Panel registry** — replaces the closed `ToolPanelView`
-  (`app/src/workspace/view/left_panel.rs:148`) with a registry of built-in
-  variants plus extension-contributed panels, rendering the
-  `PanelViewState` model with existing WarpUI tree/list components. This is the
-  largest core refactor in the sequence and is why panels are their own PR.
-
 ## Testing and validation
 
 Unit tests live beside the source as `<module>_tests.rs` included with
@@ -425,6 +467,7 @@ Unit tests live beside the source as `<module>_tests.rs` included with
 | 36 | `logging` tests: the redacting writer drops token-shaped values and environment blocks. |
 | 7–10, 11–14 | `app/src/extensions/permissions_tests.rs` and `manager_tests.rs`: a first install prompts, a reload from disk keeps the answer, an upgrade asking for more prompts again while one asking for less does not, an unreadable grant file costs a prompt rather than granting silently, an extension with no grant is discovered but never started, and a `workspace_contains` condition stays inactive until a directory is known. The manager tests drive a real child process from a `sh` plugin, which is also the check that a plugin need not be Rust. |
 | 15, 30 | Security tests: a plugin calling an undeclared method, a malformed argv, and a request naming another extension's panel are all rejected. |
+| Panels | `app/src/workspace/view/extension_panel_tests.rs`: the same path in two sections is two rows, children appear only while their parent is expanded, a collapsed section hides what is under it, a leaf's first action is what a click runs while a parent row's is not, and an icon name outside Warp's vocabulary renders without one. `tool_panel_tests.rs`: a contribution becomes a registry entry named by its manifest, global search stays the same panel as its focus moves, two extension panels match only when both ids do, and the toggle button is named after the only panel there is. `manager_tests.rs`: a snapshot answers only for the panel and extension it names, a stopped extension leaves none behind, and a panel action reaches neither an undeclared panel nor an extension that is not running. |
 | 11–12, 23, 35 | `manager_tests.rs` for the surfaces: the prompt is up before anything starts, allowing starts and records, declining leaves the extension inactive and survives a rescan, a retry asks again, a second dialog queues behind the first, stopping abandons what was outstanding, and a command is only delivered while its extension is running. The prompt and confirmation wording are asserted directly, including that an upgrade shows only what is new. `session_tests.rs` covers a deferred request producing no reply and still passing every gate. |
 
 Manual validation for the PRs that touch UI: the §47 end-to-end workflow run
@@ -444,7 +487,8 @@ Per §45 of the plan, and matching the repo's preference for focused PRs:
    views, so nothing here can regress an existing surface.
 3. **PR 3 — the surfaces that ask and invoke.** Permission prompt, contributed
    commands in the command palette, `dialog.confirm`.
-4. **PR 4 — panel API.** The `ToolPanelView` registry refactor.
+4. **PR 4 — panel API.** The `ToolPanelView` registry refactor, the
+   `PanelViewState` renderer, and `panel.action` back to the plugin.
 5. **PR 5 — workspace context and execution targets.** `WorkspaceContextService`,
    `ExecutionService`, session-staleness handling.
 6. **PR 6 — diff and file wrappers.** `DiffService`, `file.open`.
@@ -470,6 +514,6 @@ the moment PR 1 lands.
   defaulting it, and failing closed on a stale session.
 - **Shell quoting on the remote path.** Documented above; contained to one
   function in `ExecutionService` and removed by the proto follow-up.
-- **The panel registry refactor is large.** Mitigated by isolating it in PR 3
+- **The panel registry refactor is large.** Mitigated by isolating it in PR 4
   and keeping built-in panels on the same registry, so extensions are not a
   special case.

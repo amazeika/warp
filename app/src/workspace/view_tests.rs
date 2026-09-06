@@ -456,22 +456,21 @@ fn test_tools_panel_preferences_activate_after_signup_and_ai_enablement() {
         let workspace = mock_workspace(&mut app);
         workspace.update(&mut app, |workspace, ctx| {
             assert!(
-                workspace
-                    .left_panel_views
-                    .contains(&ToolPanelView::WarpDrive),
+                tool_panel::lists(&workspace.left_panel_views, &ToolPanelView::WarpDrive),
                 "the stored preference should keep the locked Warp Drive entry visible"
             );
             assert!(
-                workspace
-                    .left_panel_views
-                    .contains(&ToolPanelView::ConversationListView),
+                tool_panel::lists(
+                    &workspace.left_panel_views,
+                    &ToolPanelView::ConversationListView
+                ),
                 "the stored preference should keep the locked conversations entry visible"
             );
             workspace.left_panel_view.update(ctx, |left_panel, ctx| {
                 left_panel.handle_action_with_force_open(&LeftPanelAction::WarpDrive, false, ctx);
                 assert_eq!(
                     left_panel.active_view_availability(ctx),
-                    left_panel::ToolPanelAvailability::RequiresAccount
+                    tool_panel::ToolPanelAvailability::RequiresAccount
                 );
                 drop(left_panel.render(ctx));
 
@@ -482,7 +481,7 @@ fn test_tools_panel_preferences_activate_after_signup_and_ai_enablement() {
                 );
                 assert_eq!(
                     left_panel.active_view_availability(ctx),
-                    left_panel::ToolPanelAvailability::RequiresAccount
+                    tool_panel::ToolPanelAvailability::RequiresAccount
                 );
                 drop(left_panel.render(ctx));
             });
@@ -527,15 +526,14 @@ fn test_tools_panel_preferences_activate_after_signup_and_ai_enablement() {
                 ctx,
             );
             assert!(
-                workspace
-                    .left_panel_views
-                    .contains(&ToolPanelView::WarpDrive),
+                tool_panel::lists(&workspace.left_panel_views, &ToolPanelView::WarpDrive),
                 "Drive entry remains visible and unlocks after signup"
             );
             assert!(
-                workspace
-                    .left_panel_views
-                    .contains(&ToolPanelView::ConversationListView),
+                tool_panel::lists(
+                    &workspace.left_panel_views,
+                    &ToolPanelView::ConversationListView
+                ),
                 "conversation entry remains visible while waiting for AI"
             );
             assert!(!workspace.auth_state.is_anonymous_or_logged_out());
@@ -545,7 +543,7 @@ fn test_tools_panel_preferences_activate_after_signup_and_ai_enablement() {
                 left_panel.handle_action_with_force_open(&LeftPanelAction::WarpDrive, false, ctx);
                 assert_eq!(
                     left_panel.active_view_availability(ctx),
-                    left_panel::ToolPanelAvailability::Available
+                    tool_panel::ToolPanelAvailability::Available
                 );
 
                 left_panel.handle_action_with_force_open(
@@ -555,7 +553,7 @@ fn test_tools_panel_preferences_activate_after_signup_and_ai_enablement() {
                 );
                 assert_eq!(
                     left_panel.active_view_availability(ctx),
-                    left_panel::ToolPanelAvailability::RequiresAi
+                    tool_panel::ToolPanelAvailability::RequiresAi
                 );
                 drop(left_panel.render(ctx));
             });
@@ -572,11 +570,10 @@ fn test_tools_panel_preferences_activate_after_signup_and_ai_enablement() {
             });
         });
         workspace.update(&mut app, |workspace, ctx| {
-            assert!(
-                workspace
-                    .left_panel_views
-                    .contains(&ToolPanelView::ConversationListView)
-            );
+            assert!(tool_panel::lists(
+                &workspace.left_panel_views,
+                &ToolPanelView::ConversationListView
+            ));
             workspace.left_panel_view.update(ctx, |left_panel, ctx| {
                 left_panel.handle_action_with_force_open(
                     &LeftPanelAction::ConversationListView,
@@ -585,7 +582,7 @@ fn test_tools_panel_preferences_activate_after_signup_and_ai_enablement() {
                 );
                 assert_eq!(
                     left_panel.active_view_availability(ctx),
-                    left_panel::ToolPanelAvailability::Available
+                    tool_panel::ToolPanelAvailability::Available
                 );
             });
         });
@@ -603,11 +600,10 @@ fn test_tools_panel_preferences_activate_after_signup_and_ai_enablement() {
             });
         });
         workspace.read(&app, |workspace, _| {
-            assert!(
-                !workspace
-                    .left_panel_views
-                    .contains(&ToolPanelView::ConversationListView)
-            );
+            assert!(!tool_panel::lists(
+                &workspace.left_panel_views,
+                &ToolPanelView::ConversationListView
+            ));
         });
     });
 }
@@ -4956,16 +4952,14 @@ fn test_tools_panel_warp_drive_toggle_updates_available_views() {
         // tab and can be made the active view.
         workspace.update(&mut app, |workspace, ctx| {
             assert!(
-                workspace
-                    .left_panel_views
-                    .contains(&ToolPanelView::WarpDrive),
+                tool_panel::lists(&workspace.left_panel_views, &ToolPanelView::WarpDrive),
                 "Warp Drive should be an available tools-panel tab by default"
             );
             workspace.left_panel_view.update(ctx, |lp, ctx| {
                 lp.handle_action_with_force_open(&LeftPanelAction::WarpDrive, false, ctx);
             });
             assert_eq!(
-                workspace.left_panel_view.as_ref(ctx).active_view(),
+                *workspace.left_panel_view.as_ref(ctx).active_view(),
                 ToolPanelView::WarpDrive,
                 "Warp Drive should be selectable as the active view"
             );
@@ -4984,14 +4978,12 @@ fn test_tools_panel_warp_drive_toggle_updates_available_views() {
         });
         workspace.update(&mut app, |workspace, ctx| {
             assert!(
-                !workspace
-                    .left_panel_views
-                    .contains(&ToolPanelView::WarpDrive),
+                !tool_panel::lists(&workspace.left_panel_views, &ToolPanelView::WarpDrive),
                 "Disabling the setting should remove Warp Drive from the tools panel"
             );
             if !workspace.left_panel_views.is_empty() {
                 assert_ne!(
-                    workspace.left_panel_view.as_ref(ctx).active_view(),
+                    *workspace.left_panel_view.as_ref(ctx).active_view(),
                     ToolPanelView::WarpDrive,
                     "Active view should fall back to a remaining tab when Warp Drive is removed"
                 );
@@ -5009,16 +5001,14 @@ fn test_tools_panel_warp_drive_toggle_updates_available_views() {
         });
         workspace.update(&mut app, |workspace, ctx| {
             assert!(
-                workspace
-                    .left_panel_views
-                    .contains(&ToolPanelView::WarpDrive),
+                tool_panel::lists(&workspace.left_panel_views, &ToolPanelView::WarpDrive),
                 "Re-enabling the setting should restore Warp Drive to the tools panel"
             );
             workspace.left_panel_view.update(ctx, |lp, ctx| {
                 lp.handle_action_with_force_open(&LeftPanelAction::WarpDrive, false, ctx);
             });
             assert_eq!(
-                workspace.left_panel_view.as_ref(ctx).active_view(),
+                *workspace.left_panel_view.as_ref(ctx).active_view(),
                 ToolPanelView::WarpDrive,
                 "Warp Drive should be selectable again after re-enabling"
             );

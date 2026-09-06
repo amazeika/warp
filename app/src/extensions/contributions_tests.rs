@@ -101,3 +101,25 @@ fn commands_are_ordered_by_extension_so_the_palette_is_stable() {
         .collect();
     assert_eq!(owners, ["dev.warp.a", "dev.warp.z"]);
 }
+
+#[test]
+fn a_registered_panel_can_be_resolved_back_to_its_extension() {
+    let mut contributions = Contributions::default();
+    contributions.register(&manifest(
+        "dev.warp.a",
+        "\n[[panels]]\nid = \"git\"\ntitle = \"Git\"\nlocation = \"left\"\n",
+    ));
+
+    let panel = contributions
+        .panel("dev.warp.a", "git")
+        .expect("the panel is registered");
+    assert_eq!(panel.title, "Git");
+    assert!(
+        contributions.panel("dev.warp.a", "not.declared").is_none(),
+        "a panel id the manifest never declared must not resolve"
+    );
+    assert!(
+        contributions.panel("dev.warp.b", "git").is_none(),
+        "two extensions may use the same panel id, so the extension is part of the key"
+    );
+}

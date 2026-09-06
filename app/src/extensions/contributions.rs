@@ -56,7 +56,7 @@ impl Contributions {
                 title: command.title.clone(),
             })
             .collect();
-        let panels = manifest
+        let panels: Vec<ContributedPanel> = manifest
             .panels
             .iter()
             .map(|panel| ContributedPanel {
@@ -67,6 +67,20 @@ impl Contributions {
                 location: panel.location,
             })
             .collect();
+        // Warp's right panel is the code review pane rather than a second
+        // tools panel, so there is nowhere to host a `right` contribution yet.
+        // Saying so is the difference between an author finding the gap and
+        // one debugging a panel that never appears.
+        for panel in &panels {
+            if panel.location == PanelLocation::Right {
+                log::warn!(
+                    "Extension {} declares panel `{}` at `right`, which this Warp build cannot host; \
+                     only `left` panels are shown.",
+                    manifest.id,
+                    panel.panel_id
+                );
+            }
+        }
         self.by_extension
             .insert(manifest.id.clone(), Registered { commands, panels });
     }
@@ -96,6 +110,17 @@ impl Contributions {
             .commands
             .iter()
             .find(|command| command.command_id == command_id)
+    }
+
+    /// Resolves a panel the user just acted on back to the extension that
+    /// published it, which is also the check that an action is not delivered
+    /// for a panel the extension never declared.
+    pub fn panel(&self, extension_id: &str, panel_id: &str) -> Option<&ContributedPanel> {
+        self.by_extension
+            .get(extension_id)?
+            .panels
+            .iter()
+            .find(|panel| panel.panel_id == panel_id)
     }
 
     pub fn is_empty(&self) -> bool {

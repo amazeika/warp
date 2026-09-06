@@ -7,7 +7,7 @@
 use extension_host::{Dispatched, ExtensionHost};
 use extension_protocol::{
     Capability, DialogConfirmParams, ErrorCode, ExtensionError, Method, NotificationLevel,
-    NotificationParams, decode_params,
+    NotificationParams, PanelViewState, decode_params,
 };
 use warpui::windowing::WindowManager;
 use warpui::{ModelContext, SingletonEntity as _};
@@ -26,6 +26,7 @@ use crate::workspace::{ToastStack, WorkspaceAction};
 /// which is the only way a plugin can know whether to offer that entry point.
 pub(super) const IMPLEMENTED_CAPABILITIES: &[Capability] = &[
     Capability::CommandsV1,
+    Capability::PanelTreeV1,
     Capability::NotificationV1,
     Capability::DialogConfirmV1,
 ];
@@ -43,6 +44,9 @@ pub(super) struct BridgeHost<'a, 'ctx> {
     /// call that is being dispatched, which is the same reason this host exists
     /// only for the length of one call.
     pub question: Option<PendingConfirm>,
+    /// A panel snapshot published by this dispatch, stored by the manager once
+    /// its own borrow of the extension has ended, for the same reason.
+    pub panel_state: Option<PanelViewState>,
 }
 
 /// A `dialog.confirm` waiting to be put in front of the user.
@@ -78,6 +82,18 @@ impl ExtensionHost for BridgeHost<'_, '_> {
                 }
                 Err(error) => Dispatched::Answered(Err(error)),
             },
+            // `Session` has already checked that the extension declared this
+            // panel, so the snapshot only has to be handed on. It is answered
+            // straight away rather than deferred: storing it cannot fail, and
+            // a plugin that had to wait for a redraw before publishing the next
+            // snapshot would be paying for Warp's frame rate.
+            Method::PanelSetState => match decode_params(method, &params) {
+                Ok(state) => {
+                    self.panel_state = Some(state);
+                    Dispatched::Answered(Ok(serde_json::Value::Object(Default::default())))
+                }
+                Err(error) => Dispatched::Answered(Err(error)),
+            },
             // `dialog.input` and `dialog.select` share the `dialog.confirm.v1`
             // token with the method above, so they reach dispatch rather than
             // being refused by the capability gate. The code is still the right
@@ -93,8 +109,7 @@ impl ExtensionHost for BridgeHost<'_, '_> {
             | Method::DiffOpenWorkingTree
             | Method::DiffOpenFile
             | Method::DialogInput
-            | Method::DialogSelect
-            | Method::PanelSetState => Dispatched::Answered(Err(ExtensionError::new(
+            | Method::DialogSelect => Dispatched::Answered(Err(ExtensionError::new(
                 ErrorCode::UnsupportedCapability,
                 format!("{method} is not implemented by this Warp build"),
             ))),

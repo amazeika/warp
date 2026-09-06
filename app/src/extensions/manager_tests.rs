@@ -56,6 +56,21 @@ id = "do.thing"
 title = "Do the thing"
 "#;
 
+const PANEL: &str = r#"
+[[panels]]
+id = "git"
+title = "Git"
+location = "left"
+"#;
+
+fn panel_snapshot() -> PanelViewState {
+    PanelViewState {
+        panel_id: "git".to_owned(),
+        status: extension_protocol::PanelStatus::Ready,
+        sections: Vec::new(),
+    }
+}
+
 fn confirm_params() -> DialogConfirmParams {
     DialogConfirmParams {
         title: "Proceed?".to_owned(),
@@ -567,6 +582,90 @@ fn a_manifest_that_cannot_be_started_is_not_left_running() {
                 "a manifest whose executable is missing never becomes a managed extension"
             );
             assert_eq!(manager.rejected().len(), 1);
+        });
+    });
+}
+
+#[test]
+fn a_published_snapshot_is_readable_back_for_the_panel_it_names() {
+    let root = install(PANEL);
+    let grant_root = TempDir::new().expect("temp dir");
+
+    warpui::App::test((), |mut app| async move {
+        let manager = app.add_model(|ctx| {
+            ExtensionManager::with_paths(root.path().to_path_buf(), open_grants(&grant_root), ctx)
+        });
+
+        manager.update(&mut app, |manager, ctx| {
+            manager.set_panel_state("dev.warp.test", panel_snapshot(), ctx);
+
+            assert!(
+                manager.panel_state("dev.warp.test", "git").is_some(),
+                "the panel reads the manager's record rather than keeping its own"
+            );
+            assert!(
+                manager.panel_state("dev.warp.test", "other").is_none(),
+                "a snapshot answers only for the panel it names"
+            );
+            assert!(
+                manager.panel_state("dev.warp.other", "git").is_none(),
+                "two extensions may use the same panel id, so the extension is part of the key"
+            );
+        });
+    });
+}
+
+#[test]
+fn a_stopped_extension_leaves_no_snapshot_behind() {
+    let root = install(PANEL);
+    let grant_root = TempDir::new().expect("temp dir");
+
+    warpui::App::test((), |mut app| async move {
+        let manager = app.add_model(|ctx| {
+            ExtensionManager::with_paths(root.path().to_path_buf(), open_grants(&grant_root), ctx)
+        });
+
+        manager.update(&mut app, |manager, ctx| {
+            manager.answered(true, ctx);
+            manager.set_panel_state("dev.warp.test", panel_snapshot(), ctx);
+            assert!(manager.panel_state("dev.warp.test", "git").is_some());
+
+            manager.stop("dev.warp.test", StopReason::Requested, ctx);
+            assert!(
+                manager.panel_state("dev.warp.test", "git").is_none(),
+                "a panel left showing a state nothing is maintaining reads as \
+                 current and is not"
+            );
+        });
+    });
+}
+
+#[test]
+fn a_panel_action_is_only_delivered_for_a_declared_panel_of_a_running_extension() {
+    let root = install(PANEL);
+    let grant_root = TempDir::new().expect("temp dir");
+
+    warpui::App::test((), |mut app| async move {
+        let manager = app.add_model(|ctx| {
+            ExtensionManager::with_paths(root.path().to_path_buf(), open_grants(&grant_root), ctx)
+        });
+
+        manager.update(&mut app, |manager, ctx| {
+            // Nothing is registered until the handshake completes, so a row
+            // cannot have been drawn yet — and acting on one is a no-op rather
+            // than a message written to a plugin that has not said hello.
+            assert_eq!(manager.panels().count(), 0);
+            manager.invoke_panel_action("dev.warp.test", "git", "git.staged", "a.rs", "stage", ctx);
+            // A panel id the manifest never declared is refused by the same
+            // check, which is what keeps one extension out of another's panel.
+            manager.invoke_panel_action(
+                "dev.warp.test",
+                "not.declared",
+                "git.staged",
+                "a.rs",
+                "stage",
+                ctx,
+            );
         });
     });
 }

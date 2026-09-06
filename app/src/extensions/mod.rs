@@ -34,5 +34,5 @@ mod host;
 mod manager;
 mod permissions;
 
-pub(crate) use contributions::ContributedCommand;
-pub(crate) use manager::ExtensionManager;
+pub(crate) use contributions::{ContributedCommand, ContributedPanel};
+pub(crate) use manager::{ExtensionManager, ExtensionManagerEvent};
