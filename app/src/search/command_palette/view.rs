@@ -24,6 +24,7 @@ use super::super::palette_styles as styles;
 use super::CommandPaletteMixer;
 use crate::appearance::Appearance;
 use crate::drive::CloudObjectTypeAndId;
+use crate::extensions::ExtensionManager;
 use crate::features::FeatureFlag;
 use crate::palette::PaletteMode;
 use crate::root_view::OpenLaunchConfigArg;
@@ -1004,6 +1005,21 @@ impl View {
                 if let Some(terminal_view_id) = terminal_view_id {
                     ctx.dispatch_typed_action(&WorkspaceAction::StartNewConversation {
                         terminal_view_id,
+                    });
+                }
+            }
+            CommandPaletteItemAction::InvokeExtensionCommand {
+                extension_id,
+                command_id,
+            } => {
+                // Only reachable while extensions are running — the data source
+                // that produced this entry asks the same question — but the
+                // palette must not be the thing that crashes if that ever stops
+                // being true.
+                if ctx.has_singleton_model::<ExtensionManager>() {
+                    let manager = ExtensionManager::handle(ctx);
+                    manager.update(ctx, |manager, ctx| {
+                        manager.invoke_command(&extension_id, &command_id, ctx);
                     });
                 }
             }

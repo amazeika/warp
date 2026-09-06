@@ -26,8 +26,9 @@ fn an_unknown_extension_is_always_prompted_for() {
     let root = TempDir::new().expect("temp dir");
     let store = open_store(&root);
 
-    let PermissionDecision::Prompt { requested, added } =
-        store.decide(&manifest("\n[permissions]\nui_notifications = true\n"))
+    let PermissionDecision::Prompt {
+        requested, added, ..
+    } = store.decide(&manifest("\n[permissions]\nui_notifications = true\n"))
     else {
         panic!("a never-seen extension must be prompted for");
     };
@@ -68,7 +69,12 @@ fn an_upgrade_asking_for_more_is_prompted_for_again() {
     let widened = manifest(
         "\n[permissions]\nui_notifications = true\nprocess_execute = true\n\n[execution]\nallowed_executables = [\"git\"]\n",
     );
-    let PermissionDecision::Prompt { added, .. } = store.decide(&widened) else {
+    let PermissionDecision::Prompt {
+        added,
+        added_executables,
+        ..
+    } = store.decide(&widened)
+    else {
         panic!("a widened manifest must be prompted for again");
     };
     assert_eq!(
@@ -76,6 +82,51 @@ fn an_upgrade_asking_for_more_is_prompted_for_again() {
         [Permission::ProcessExecute],
         "only the newly requested permission is reported as added"
     );
+    assert_eq!(added_executables, ["git"]);
+}
+
+#[test]
+fn an_upgrade_that_only_adds_an_executable_is_prompted_for_again() {
+    let root = TempDir::new().expect("temp dir");
+    let mut store = open_store(&root);
+    let executes = "\n[permissions]\nprocess_execute = true\n\n[execution]\n";
+    store
+        .grant(&manifest(&format!(
+            "{executes}allowed_executables = [\"git\"]\n"
+        )))
+        .expect("the grant is written");
+
+    let widened = manifest(&format!(
+        "{executes}allowed_executables = [\"git\", \"rm\"]\n"
+    ));
+    let PermissionDecision::Prompt {
+        added,
+        added_executables,
+        ..
+    } = store.decide(&widened)
+    else {
+        panic!(
+            "the allowlist is the whole of what limits process.execute, so adding to it is \
+             asking for more than the user agreed to"
+        );
+    };
+    assert!(added.is_empty(), "the permission set itself is unchanged");
+    assert_eq!(added_executables, ["rm"]);
+}
+
+#[test]
+fn dropping_an_executable_stays_covered() {
+    let root = TempDir::new().expect("temp dir");
+    let mut store = open_store(&root);
+    let executes = "\n[permissions]\nprocess_execute = true\n\n[execution]\n";
+    store
+        .grant(&manifest(&format!(
+            "{executes}allowed_executables = [\"git\", \"rm\"]\n"
+        )))
+        .expect("the grant is written");
+
+    let narrowed = manifest(&format!("{executes}allowed_executables = [\"git\"]\n"));
+    assert_eq!(store.decide(&narrowed), PermissionDecision::Granted);
 }
 
 #[test]

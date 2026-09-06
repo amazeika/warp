@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use command::blocking::Command;
 use extension_host::{
-    ExtensionHost, ExtensionProcess, ExtensionRecord, ProcessEvent, Session, discover_in,
+    Dispatched, ExtensionHost, ExtensionProcess, ExtensionRecord, ProcessEvent, Session,
+    discover_in,
 };
 use extension_protocol::{
     ActionOrigin, Capability, CommandInvokedParams, EventEnvelope, EventKind, ExecutionRunParams,
@@ -130,6 +131,17 @@ impl ExtensionHost for GitHost {
     }
 
     fn dispatch(
+        &mut self,
+        _request_id: &str,
+        method: Method,
+        params: serde_json::Value,
+    ) -> Dispatched {
+        Dispatched::Answered(self.answer(method, params))
+    }
+}
+
+impl GitHost {
+    fn answer(
         &mut self,
         method: Method,
         params: serde_json::Value,
@@ -663,6 +675,17 @@ impl ExtensionHost for NoRepositoryHost {
     }
 
     fn dispatch(
+        &mut self,
+        _request_id: &str,
+        method: Method,
+        params: serde_json::Value,
+    ) -> Dispatched {
+        Dispatched::Answered(self.answer(method, params))
+    }
+}
+
+impl NoRepositoryHost {
+    fn answer(
         &mut self,
         method: Method,
         params: serde_json::Value,

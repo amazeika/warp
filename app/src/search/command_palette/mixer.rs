@@ -81,6 +81,11 @@ pub enum CommandPaletteItemAction {
     },
     /// Start a new AI conversation
     NewConversation,
+    /// Run a command an extension contributed.
+    InvokeExtensionCommand {
+        extension_id: String,
+        command_id: String,
+    },
     /// No-op action (used for non-interactable separator items that don't do anything on click).
     NoOp,
 }
@@ -146,6 +151,13 @@ impl CommandPaletteItemAction {
                 ItemSummary::Project { path: path.clone() }
             }
             CommandPaletteItemAction::NewConversation => ItemSummary::NewConversation,
+            CommandPaletteItemAction::InvokeExtensionCommand {
+                extension_id,
+                command_id,
+            } => ItemSummary::ExtensionCommand {
+                extension_id: extension_id.clone(),
+                command_id: command_id.clone(),
+            },
             CommandPaletteItemAction::NoOp => ItemSummary::NoOp,
         }
     }
@@ -207,6 +219,14 @@ pub enum ItemSummary {
     },
     ForkConversation,
     NewConversation,
+    /// A command contributed by an extension. It is identified by the pair the
+    /// manifest declared rather than by anything the running process owns, so a
+    /// recent entry survives the plugin restarting — and resolves to nothing
+    /// while the extension is not running, which is the point.
+    ExtensionCommand {
+        extension_id: String,
+        command_id: String,
+    },
     /// No-op action (used for non-interactable separator items that don't do anything on click).
     NoOp,
 }

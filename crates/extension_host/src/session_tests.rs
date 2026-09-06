@@ -16,6 +16,7 @@ command = "./warp-git"
 [permissions]
 workspace_read = true
 process_execute = true
+ui_dialogs = true
 
 [execution]
 allowed_executables = ["git"]
@@ -36,13 +37,24 @@ location = "left"
 struct RecordingHost {
     capabilities: Vec<Capability>,
     dispatched: Vec<Method>,
+    /// Methods this host takes now and answers later, as the app does for a
+    /// dialog whose answer is a click away.
+    defers: Vec<Method>,
+    deferred_request_ids: Vec<String>,
 }
 
 impl RecordingHost {
     fn with_all_capabilities() -> Self {
         Self {
             capabilities: Capability::ALL.to_vec(),
-            dispatched: Vec::new(),
+            ..Default::default()
+        }
+    }
+
+    fn deferring(method: Method) -> Self {
+        Self {
+            defers: vec![method],
+            ..Self::with_all_capabilities()
         }
     }
 }
@@ -54,11 +66,16 @@ impl ExtensionHost for RecordingHost {
 
     fn dispatch(
         &mut self,
+        request_id: &str,
         method: Method,
         _params: serde_json::Value,
-    ) -> Result<serde_json::Value, extension_protocol::ExtensionError> {
+    ) -> Dispatched {
         self.dispatched.push(method);
-        Ok(json!({ "dispatched": method.as_str() }))
+        if self.defers.contains(&method) {
+            self.deferred_request_ids.push(request_id.to_owned());
+            return Dispatched::Deferred;
+        }
+        Dispatched::Answered(Ok(json!({ "dispatched": method.as_str() })))
     }
 }
 
@@ -215,7 +232,7 @@ fn an_undeclared_permission_is_denied_without_reaching_the_host() {
 fn an_unadvertised_capability_is_reported_as_unsupported_not_denied() {
     let host = RecordingHost {
         capabilities: vec![Capability::WorkspaceContextV1],
-        dispatched: Vec::new(),
+        ..Default::default()
     };
     let mut session = initialized_session(host);
     let payload = request(&mut session, Method::ExecutionRun, run_params("git"));
@@ -329,4 +346,46 @@ fn a_remote_target_is_carried_through_unchanged() {
 
     let payload = request(&mut session, Method::ExecutionRun, params);
     assert!(matches!(payload, ResponsePayload::Ok { .. }));
+}
+
+#[test]
+fn a_deferred_request_is_answered_by_the_host_rather_than_the_session() {
+    let mut session = initialized_session(RecordingHost::deferring(Method::DialogConfirm));
+
+    let message = Message::Request(RequestEnvelope::new(
+        "7",
+        Method::DialogConfirm,
+        json!({
+            "title": "Discard changes?",
+            "confirm_label": "Discard",
+            "cancel_label": "Keep",
+            "destructive": true
+        }),
+    ));
+    assert!(
+        session.handle(message).is_none(),
+        "a question the user has not answered yet has no reply to write back"
+    );
+    assert_eq!(session.host.dispatched, [Method::DialogConfirm]);
+    assert_eq!(
+        session.host.deferred_request_ids,
+        ["7"],
+        "the host is given the id it owes an answer for"
+    );
+}
+
+#[test]
+fn a_deferrable_method_is_still_refused_before_the_handshake() {
+    let mut session = session(RecordingHost::deferring(Method::DialogConfirm));
+    let payload = request(
+        &mut session,
+        Method::DialogConfirm,
+        json!({ "title": "?", "confirm_label": "Yes", "cancel_label": "No" }),
+    );
+    assert_eq!(
+        error_code(payload),
+        ErrorCode::InvalidRequest,
+        "deferral must not be a way around the handshake"
+    );
+    assert!(session.host.dispatched.is_empty());
 }

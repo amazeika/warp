@@ -5,6 +5,26 @@ use extension_protocol::{
     PermissionSet, RequestEnvelope, ResponseEnvelope, decode_params,
 };
 
+/// What a host did with one request.
+///
+/// Some answers cannot be produced inside the call that asks for them: a dialog
+/// is answered when the user clicks, which is many frames after the dispatch
+/// returns. [`Dispatched::Deferred`] is the host saying it has taken the
+/// request and will write the response for that `request_id` itself.
+pub enum Dispatched {
+    /// The answer is ready now, and the session writes it back.
+    Answered(Result<serde_json::Value, ExtensionError>),
+    /// Nothing is written now. The host owes the plugin exactly one response
+    /// carrying the `request_id` it was given.
+    Deferred,
+}
+
+impl From<Result<serde_json::Value, ExtensionError>> for Dispatched {
+    fn from(result: Result<serde_json::Value, ExtensionError>) -> Self {
+        Dispatched::Answered(result)
+    }
+}
+
 /// The Warp side of the extension API.
 ///
 /// The app implements this; everything above it — permissions, capabilities,
@@ -14,11 +34,14 @@ pub trait ExtensionHost {
     /// Capabilities this build actually implements, advertised at handshake.
     fn capabilities(&self) -> Vec<Capability>;
 
+    /// Carries out one request. `request_id` is only needed by a host that
+    /// answers later; a host that answers every method inline can ignore it.
     fn dispatch(
         &mut self,
+        request_id: &str,
         method: Method,
         params: serde_json::Value,
-    ) -> Result<serde_json::Value, ExtensionError>;
+    ) -> Dispatched;
 }
 
 /// One extension's connection state and the gates its requests pass through.
@@ -59,6 +82,9 @@ impl Session {
     /// Messages a plugin should not be sending — responses and events, neither
     /// of which the host solicits in v0.1 — are dropped rather than answered,
     /// because there is nothing to answer.
+    /// A request the host deferred yields no reply here: the host answers it
+    /// once the user does, which is the only way a modal question can be
+    /// carried over a protocol whose calls return immediately.
     pub fn handle_message<H: ExtensionHost>(
         &mut self,
         message: Message,
@@ -66,7 +92,7 @@ impl Session {
     ) -> Option<Message> {
         match message {
             Message::Request(request) => {
-                Some(Message::Response(self.handle_request(request, host)))
+                Some(Message::Response(self.handle_request(request, host)?))
             }
             Message::Event(_) | Message::Response(_) => None,
         }
@@ -76,11 +102,12 @@ impl Session {
         &mut self,
         request: RequestEnvelope,
         host: &mut H,
-    ) -> ResponseEnvelope {
+    ) -> Option<ResponseEnvelope> {
         let request_id = request.request_id.clone();
         match self.dispatch_request(request, host) {
-            Ok(result) => ResponseEnvelope::ok(request_id, result),
-            Err(error) => ResponseEnvelope::error(request_id, error),
+            Dispatched::Answered(Ok(result)) => Some(ResponseEnvelope::ok(request_id, result)),
+            Dispatched::Answered(Err(error)) => Some(ResponseEnvelope::error(request_id, error)),
+            Dispatched::Deferred => None,
         }
     }
 
@@ -88,35 +115,47 @@ impl Session {
         &mut self,
         request: RequestEnvelope,
         host: &mut H,
-    ) -> Result<serde_json::Value, ExtensionError> {
+    ) -> Dispatched {
         if request.protocol != PROTOCOL_VERSION {
-            return Err(ExtensionError::new(
+            return Dispatched::Answered(Err(ExtensionError::new(
                 ErrorCode::ProtocolMismatch,
                 format!(
                     "request declares protocol version {}, expected {PROTOCOL_VERSION}",
                     request.protocol
                 ),
-            ));
+            )));
         }
 
         if request.method == Method::ExtensionInitialize {
-            return self.initialize(&request.params, host);
+            return self.initialize(&request.params, host).into();
         }
         if !self.initialized {
-            return Err(ExtensionError::new(
+            return Dispatched::Answered(Err(ExtensionError::new(
                 ErrorCode::InvalidRequest,
                 format!(
                     "{} was called before extension.initialize",
                     request.method.as_str()
                 ),
-            ));
+            )));
         }
 
-        self.ensure_capability(request.method, host)?;
-        self.ensure_permission(request.method)?;
-        self.ensure_request_policy(request.method, &request.params)?;
+        if let Err(error) = self.gate(request.method, &request.params, host) {
+            return Dispatched::Answered(Err(error));
+        }
 
-        host.dispatch(request.method, request.params)
+        host.dispatch(&request.request_id, request.method, request.params)
+    }
+
+    /// Every check a request passes before the host sees it.
+    fn gate<H: ExtensionHost>(
+        &self,
+        method: Method,
+        params: &serde_json::Value,
+        host: &H,
+    ) -> Result<(), ExtensionError> {
+        self.ensure_capability(method, host)?;
+        self.ensure_permission(method)?;
+        self.ensure_request_policy(method, params)
     }
 
     fn initialize<H: ExtensionHost>(

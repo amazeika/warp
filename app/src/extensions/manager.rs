@@ -4,7 +4,7 @@
 //! the main thread and holds each plugin's process handle and session, so all
 //! state transitions happen in one place with no locking; the only work done
 //! elsewhere is the blocking read of each plugin's stdout.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
@@ -14,12 +14,17 @@ use extension_host::{
     ExtensionProcess, ExtensionState, ProcessEvent, RestartDecision, Session, StateMachine,
     StopReason, extension_log_path, extensions_root,
 };
-use extension_protocol::{Activation, ExtensionManifest, Permission, PermissionSet};
+use extension_protocol::{
+    ActionOrigin, Activation, CommandInvokedParams, DialogConfirmParams, DialogConfirmResult,
+    EventEnvelope, EventKind, ExecutionTarget, ExtensionManifest, Message, Permission,
+    PermissionSet, ResponseEnvelope,
+};
 use instant::Instant;
 use warpui::r#async::Timer;
-use warpui::{Entity, ModelContext, ModelSpawner, SingletonEntity};
+use warpui::{AppContext, Entity, ModelContext, ModelSpawner, SingletonEntity};
 
 use super::contributions::{ContributedCommand, ContributedPanel, Contributions};
+use super::dialog::{self, Question};
 use super::host::BridgeHost;
 use super::permissions::{GrantStore, PermissionDecision};
 
@@ -32,26 +37,66 @@ const START_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a plugin is given to exit after being asked to.
 const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long to wait before offering a question again that had nowhere to go.
+///
+/// Extensions are discovered while Warp is still starting, before a window
+/// exists to prompt in. Nothing is waiting on a permission question, so it is
+/// kept and retried rather than answered on the user's behalf.
+const ASK_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+
 /// What the UI needs to know about the extensions Warp is running.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExtensionManagerEvent {
     /// A command or panel appeared or disappeared.
     ContributionsChanged,
-    /// The extension cannot start until the user answers.
-    PermissionRequired {
-        extension_id: String,
-        extension_name: String,
-        requested: PermissionSet,
-        /// Empty on a first install; on an upgrade, only what is newly asked
-        /// for — that is the part of a second prompt worth reading.
-        added: Vec<Permission>,
-    },
     /// Warp has given up restarting this extension.
     Failed {
         extension_id: String,
         extension_name: String,
         reason: String,
     },
+}
+
+/// What answering the question currently on screen does.
+///
+/// The queue holds outcomes rather than closures so a question's effect can be
+/// asserted without a window to click in, and so a question whose extension
+/// went away can be neutralised in place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Outcome {
+    /// Start the extension if allowed; leave it inactive and unasked-about if
+    /// not.
+    Permission { extension_id: String },
+    /// Answer one `dialog.confirm` request.
+    Dialog {
+        extension_id: String,
+        request_id: String,
+    },
+    /// The extension stopped while its question was on screen. The click is
+    /// still coming and now has nothing to act on, but the modal still has to
+    /// close before the next question can be asked.
+    Abandoned,
+}
+
+impl Outcome {
+    fn extension_id(&self) -> Option<&str> {
+        match self {
+            Outcome::Permission { extension_id } | Outcome::Dialog { extension_id, .. } => {
+                Some(extension_id)
+            }
+            Outcome::Abandoned => None,
+        }
+    }
+
+    fn is_permission(&self) -> bool {
+        matches!(self, Outcome::Permission { .. })
+    }
+}
+
+/// One question waiting to be asked, or being asked right now.
+struct PendingQuestion {
+    question: Question,
+    outcome: Outcome,
 }
 
 /// One extension Warp knows about, running or not.
@@ -83,6 +128,19 @@ pub struct ExtensionManager {
     /// workspace context exists, which keeps a `workspace_contains` extension
     /// inactive rather than guessing.
     workspace_directory: Option<PathBuf>,
+    /// Questions waiting for the user, and the one they are looking at.
+    ///
+    /// Warp asks one at a time: the modal surface holds a single dialog, so a
+    /// second question shown over the first would replace it, and the answer
+    /// the plugin is blocked on would never arrive.
+    questions: VecDeque<PendingQuestion>,
+    asking: Option<Outcome>,
+    /// Set while a retry of an unaskable question is already pending, so a
+    /// second question does not queue a second timer.
+    retry_scheduled: bool,
+    /// Extensions the user declined. A refusal is an answer, so Warp stops
+    /// asking until the user comes back to the extension themselves.
+    declined: BTreeSet<String>,
 }
 
 impl Entity for ExtensionManager {
@@ -110,6 +168,10 @@ impl ExtensionManager {
             rejected: Vec::new(),
             spawner: ctx.spawner(),
             workspace_directory: None,
+            questions: VecDeque::new(),
+            asking: None,
+            retry_scheduled: false,
+            declined: BTreeSet::new(),
         };
         manager.refresh(ctx);
         manager
@@ -188,20 +250,48 @@ impl ExtensionManager {
     /// otherwise. Nothing runs before the answer: the prompt is the gate, not a
     /// notice about something that already happened.
     pub fn activate(&mut self, extension_id: &str, ctx: &mut ModelContext<Self>) {
+        if self.declined.contains(extension_id) || self.is_awaiting_permission(extension_id) {
+            return;
+        }
         let Some(extension) = self.extensions.get(extension_id) else {
             return;
         };
         match self.grants.decide(&extension.manifest) {
             PermissionDecision::Granted => self.start(extension_id, ctx),
-            PermissionDecision::Prompt { requested, added } => {
-                ctx.emit(ExtensionManagerEvent::PermissionRequired {
-                    extension_id: extension_id.to_owned(),
-                    extension_name: extension.manifest.name.clone(),
-                    requested,
-                    added,
-                });
+            PermissionDecision::Prompt {
+                requested,
+                executables,
+                added,
+                added_executables,
+            } => {
+                let question = permission_question(
+                    &extension.manifest.name,
+                    &requested,
+                    &executables,
+                    &added,
+                    &added_executables,
+                );
+                self.ask(
+                    PendingQuestion {
+                        question,
+                        outcome: Outcome::Permission {
+                            extension_id: extension_id.to_owned(),
+                        },
+                    },
+                    ctx,
+                );
             }
         }
+    }
+
+    /// Asks again about an extension the user previously declined.
+    ///
+    /// Declining is remembered for the session, so this is the only way back:
+    /// a refusal must not be undone by a directory rescan the user did not ask
+    /// for.
+    pub fn retry(&mut self, extension_id: &str, ctx: &mut ModelContext<Self>) {
+        self.declined.remove(extension_id);
+        self.activate(extension_id, ctx);
     }
 
     /// Records the user's consent and starts the extension.
@@ -214,6 +304,7 @@ impl ExtensionManager {
             // write the record only means they will be asked again next time.
             log::warn!("Failed to record the grant for {extension_id}: {err}");
         }
+        self.declined.remove(extension_id);
         self.start(extension_id, ctx);
     }
 
@@ -223,6 +314,236 @@ impl ExtensionManager {
             log::warn!("Failed to revoke the grant for {extension_id}: {err}");
         }
         self.stop(extension_id, StopReason::Requested, ctx);
+    }
+
+    /// Queues one question and shows it if nothing else is being asked.
+    fn ask(&mut self, pending: PendingQuestion, ctx: &mut ModelContext<Self>) {
+        self.questions.push_back(pending);
+        self.show_next_question(ctx);
+    }
+
+    fn show_next_question(&mut self, ctx: &mut ModelContext<Self>) {
+        while self.asking.is_none() {
+            let Some(pending) = self.questions.pop_front() else {
+                return;
+            };
+            let shown = dialog::show(
+                &pending.question,
+                |confirmed, ctx: &mut AppContext| {
+                    let manager = Self::handle(&*ctx);
+                    manager.update(ctx, |manager, ctx| manager.answered(confirmed, ctx));
+                },
+                ctx,
+            );
+            if shown {
+                self.asking = Some(pending.outcome);
+                return;
+            }
+
+            match pending.outcome {
+                // A plugin is blocked on this one, so it gets an answer now,
+                // and a confirmation nobody gave is a refusal.
+                outcome @ (Outcome::Dialog { .. } | Outcome::Abandoned) => {
+                    self.resolve(outcome, false, ctx);
+                }
+                // Nothing is waiting on a permission prompt, so it keeps its
+                // place until Warp has somewhere to show it. Answering it here
+                // would decline an extension the user was never shown.
+                outcome => {
+                    self.questions.push_front(PendingQuestion {
+                        question: pending.question,
+                        outcome,
+                    });
+                    self.schedule_retry(ctx);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn schedule_retry(&mut self, ctx: &mut ModelContext<Self>) {
+        if self.retry_scheduled {
+            return;
+        }
+        self.retry_scheduled = true;
+        ctx.spawn(
+            async move {
+                Timer::after(ASK_RETRY_INTERVAL).await;
+            },
+            |manager, _, ctx| {
+                manager.retry_scheduled = false;
+                manager.show_next_question(ctx);
+            },
+        );
+    }
+
+    /// The user answered the question currently on screen.
+    fn answered(&mut self, confirmed: bool, ctx: &mut ModelContext<Self>) {
+        let Some(outcome) = self.asking.take() else {
+            return;
+        };
+        self.resolve(outcome, confirmed, ctx);
+        self.show_next_question(ctx);
+    }
+
+    fn resolve(&mut self, outcome: Outcome, confirmed: bool, ctx: &mut ModelContext<Self>) {
+        match outcome {
+            Outcome::Permission { extension_id } => {
+                if confirmed {
+                    self.allow(&extension_id, ctx);
+                } else {
+                    self.declined.insert(extension_id);
+                }
+            }
+            Outcome::Dialog {
+                extension_id,
+                request_id,
+            } => self.answer_dialog(&extension_id, request_id, confirmed),
+            Outcome::Abandoned => {}
+        }
+    }
+
+    /// True when this extension already has a permission question outstanding,
+    /// so a rescan while the prompt is up does not stack a second one.
+    fn is_awaiting_permission(&self, extension_id: &str) -> bool {
+        let outstanding = self
+            .questions
+            .iter()
+            .map(|pending| &pending.outcome)
+            .chain(self.asking.iter());
+        outstanding
+            .filter(|outcome| outcome.is_permission())
+            .any(|outcome| outcome.extension_id() == Some(extension_id))
+    }
+
+    /// Drops the questions belonging to an extension that is going away.
+    ///
+    /// The one already on screen cannot be withdrawn, so it is neutralised
+    /// instead: the click still closes the modal and lets the next question
+    /// through, but it no longer starts a plugin or answers a request that no
+    /// longer exists.
+    fn abandon_questions(&mut self, extension_id: &str) {
+        self.questions
+            .retain(|pending| pending.outcome.extension_id() != Some(extension_id));
+        if self
+            .asking
+            .as_ref()
+            .is_some_and(|outcome| outcome.extension_id() == Some(extension_id))
+        {
+            self.asking = Some(Outcome::Abandoned);
+        }
+    }
+
+    /// Asks the user a plugin's `dialog.confirm` question.
+    ///
+    /// The answer is written back from [`Self::answer_dialog`] once they click,
+    /// which is why the dispatch that got here returned `Deferred`.
+    pub(super) fn confirm(
+        &mut self,
+        extension_id: &str,
+        request_id: String,
+        params: DialogConfirmParams,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let Some(extension) = self.extensions.get(extension_id) else {
+            return;
+        };
+        self.ask(
+            PendingQuestion {
+                question: confirm_question(&extension.manifest.name, params),
+                outcome: Outcome::Dialog {
+                    extension_id: extension_id.to_owned(),
+                    request_id,
+                },
+            },
+            ctx,
+        );
+    }
+
+    fn answer_dialog(&mut self, extension_id: &str, request_id: String, confirmed: bool) {
+        let Some(running) = self
+            .extensions
+            .get_mut(extension_id)
+            .and_then(|extension| extension.running.as_mut())
+        else {
+            return;
+        };
+        let result = match serde_json::to_value(DialogConfirmResult { confirmed }) {
+            Ok(result) => result,
+            Err(err) => {
+                log::warn!("Failed to encode a dialog answer for {extension_id}: {err}");
+                return;
+            }
+        };
+        let response = Message::Response(ResponseEnvelope::ok(request_id, result));
+        if let Err(err) = running.process.send(&response) {
+            log::warn!("Failed to answer the dialog for extension {extension_id}: {err}");
+        }
+    }
+
+    /// Tells an extension that the user picked one of its palette entries.
+    ///
+    /// The lookup is against the live contribution registry rather than the
+    /// manifest, so an entry that outlived its extension by a frame invokes
+    /// nothing instead of reaching a plugin that is not there to answer.
+    pub fn invoke_command(
+        &mut self,
+        extension_id: &str,
+        command_id: &str,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if self
+            .contributions
+            .command(extension_id, command_id)
+            .is_none()
+        {
+            return;
+        }
+        let origin = self.origin(ctx);
+        let event = match EventEnvelope::with_params(
+            EventKind::CommandInvoked,
+            &CommandInvokedParams {
+                command_id: command_id.to_owned(),
+                origin,
+            },
+        ) {
+            Ok(event) => Message::Event(event),
+            Err(err) => {
+                log::warn!("Failed to encode {command_id} for extension {extension_id}: {err}");
+                return;
+            }
+        };
+        let Some(running) = self
+            .extensions
+            .get_mut(extension_id)
+            .and_then(|extension| extension.running.as_mut())
+        else {
+            return;
+        };
+        if let Err(err) = running.process.send(&event) {
+            log::warn!("Failed to deliver {command_id} to extension {extension_id}: {err}");
+        }
+    }
+
+    /// Where an action the user just took is anchored.
+    ///
+    /// Captured at invocation and carried in the event, so a plugin that is
+    /// slow to respond acts on the workspace the user was looking at rather
+    /// than the one they moved to. Only the window is known at this point; the
+    /// session, repository root and remote execution target arrive with the
+    /// workspace-context service, and are left unset rather than guessed —
+    /// naming the wrong target is how a remote action lands on a local path.
+    fn origin(&self, ctx: &AppContext) -> ActionOrigin {
+        ActionOrigin {
+            workspace_id: ctx
+                .windows()
+                .active_window()
+                .map(|window_id| window_id.to_string())
+                .unwrap_or_default(),
+            session_id: None,
+            repository_root: None,
+            execution_target: ExecutionTarget::Local,
+        }
     }
 
     fn start(&mut self, extension_id: &str, ctx: &mut ModelContext<Self>) {
@@ -290,6 +611,7 @@ impl ExtensionManager {
             return;
         };
         extension.state.stopping();
+        self.abandon_questions(extension_id);
         running.process.stop(STOP_TIMEOUT);
         // Dropping the process closes the event channel, which is what ends the
         // pump thread. The pump is deliberately not joined here: a stop is
@@ -354,32 +676,44 @@ impl ExtensionManager {
     fn handle_message(
         &mut self,
         extension_id: &str,
-        message: extension_protocol::Message,
+        message: Message,
         ctx: &mut ModelContext<Self>,
     ) -> bool {
-        let Some(extension) = self.extensions.get_mut(extension_id) else {
-            return false;
-        };
-        let Some(running) = extension.running.as_mut() else {
-            return false;
-        };
-        let was_initialized = running.session.is_initialized();
+        let (became_initialized, question) = {
+            let Some(extension) = self.extensions.get_mut(extension_id) else {
+                return false;
+            };
+            let Some(running) = extension.running.as_mut() else {
+                return false;
+            };
+            let was_initialized = running.session.is_initialized();
 
-        let mut host = BridgeHost {
-            extension_name: extension.manifest.name.clone(),
-            ctx,
+            let mut host = BridgeHost {
+                extension_id: extension_id.to_owned(),
+                extension_name: extension.manifest.name.clone(),
+                ctx,
+                question: None,
+            };
+            let reply = running.session.handle_message(message, &mut host);
+            let question = host.question;
+
+            if let Some(reply) = reply
+                && let Err(err) = running.process.send(&reply)
+            {
+                log::warn!("Failed to answer extension {extension_id}: {err}");
+            }
+
+            let became_initialized = !was_initialized && running.session.is_initialized();
+            if became_initialized {
+                extension.state.running();
+            }
+            (became_initialized, question)
         };
-        let reply = running.session.handle_message(message, &mut host);
 
-        if let Some(reply) = reply
-            && let Err(err) = running.process.send(&reply)
-        {
-            log::warn!("Failed to answer extension {extension_id}: {err}");
-        }
-
-        let became_initialized = !was_initialized && running.session.is_initialized();
-        if became_initialized {
-            extension.state.running();
+        // Queued out here because asking touches the manager as a whole, and
+        // the dispatch above held it borrowed for one extension.
+        if let Some(question) = question {
+            self.confirm(extension_id, question.request_id, question.params, ctx);
         }
         became_initialized
     }
@@ -433,6 +767,81 @@ impl ExtensionManager {
     /// Extensions that could not be validated, with the reason to show.
     pub fn rejected(&self) -> &[(PathBuf, String)] {
         &self.rejected
+    }
+}
+
+/// The permission prompt's wording.
+///
+/// A first install lists everything, because the user has agreed to nothing
+/// yet. An upgrade lists only what is new: the whole point of asking a second
+/// time is the difference, and re-reading the unchanged half is how a prompt
+/// stops being read at all.
+fn permission_question(
+    extension_name: &str,
+    requested: &PermissionSet,
+    executables: &[String],
+    added: &[Permission],
+    added_executables: &[String],
+) -> Question {
+    let is_upgrade = !added.is_empty() || !added_executables.is_empty();
+    let (title, lead, permissions, programs) = if is_upgrade {
+        (
+            format!("{extension_name} is asking for more access"),
+            "This version additionally wants to:",
+            added.to_vec(),
+            added_executables.to_vec(),
+        )
+    } else {
+        (
+            format!("Allow {extension_name} to run?"),
+            "This extension will be able to:",
+            requested.iter().collect(),
+            executables.to_vec(),
+        )
+    };
+
+    let mut body = vec![lead.to_owned()];
+    body.extend(
+        permissions
+            .iter()
+            .map(|permission| format!("  • {}", permission.description())),
+    );
+    if !programs.is_empty() {
+        // Named rather than summarised: `process.execute` says nothing on its
+        // own, and the list is the whole of what limits it.
+        body.push(format!(
+            "  • Run only these programs: {}",
+            programs.join(", ")
+        ));
+    }
+
+    Question {
+        title,
+        body: body.join("\n"),
+        confirm_label: "Allow".to_owned(),
+        cancel_label: "Don't allow".to_owned(),
+    }
+}
+
+/// A plugin's own confirmation, worded by the plugin but rendered by Warp.
+///
+/// The extension is named in the title because a question a user did not
+/// expect has to say who is asking, and a destructive one says so in the
+/// body: Warp owns this presentation precisely so a plugin cannot make an
+/// irreversible action look routine.
+fn confirm_question(extension_name: &str, params: DialogConfirmParams) -> Question {
+    let mut body = Vec::new();
+    if let Some(text) = params.body {
+        body.push(text);
+    }
+    if params.destructive {
+        body.push("This cannot be undone.".to_owned());
+    }
+    Question {
+        title: format!("{extension_name}: {}", params.title),
+        body: body.join("\n"),
+        confirm_label: params.confirm_label,
+        cancel_label: params.cancel_label,
     }
 }
 

@@ -23,4 +23,4 @@ pub use discovery::{
 pub use lifecycle::{ExtensionState, RestartDecision, RestartPolicy, StateMachine, StopReason};
 pub use logging::{RedactingWriter, extension_log_path, extension_log_path_in, extension_log_root};
 pub use process::{ExtensionProcess, ProcessError, ProcessEvent};
-pub use session::{ExtensionHost, Session};
+pub use session::{Dispatched, ExtensionHost, Session};

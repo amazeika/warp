@@ -29,8 +29,10 @@
 //! the main thread, so extension state needs no locks and a dispatch can touch
 //! models directly.
 mod contributions;
+mod dialog;
 mod host;
 mod manager;
 mod permissions;
 
+pub(crate) use contributions::ContributedCommand;
 pub(crate) use manager::ExtensionManager;

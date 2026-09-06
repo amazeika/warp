@@ -20,8 +20,8 @@ use std::time::Duration;
 
 use command::blocking::Command;
 use extension_host::{
-    DiscoveredExtension, ExtensionHost, ExtensionProcess, ExtensionRecord, ProcessEvent, Session,
-    discover_in,
+    DiscoveredExtension, Dispatched, ExtensionHost, ExtensionProcess, ExtensionRecord,
+    ProcessEvent, Session, discover_in,
 };
 use extension_protocol::{
     ActionOrigin, Capability, CommandInvokedParams, EventEnvelope, EventKind, ExecutionRunParams,
@@ -435,7 +435,20 @@ impl ExtensionHost for DevHost {
         Capability::ALL.to_vec()
     }
 
+    /// Every method is answered inline: the terminal prompts block, so there is
+    /// nothing here that has to be deferred the way a Warp modal does.
     fn dispatch(
+        &mut self,
+        _request_id: &str,
+        method: Method,
+        params: serde_json::Value,
+    ) -> Dispatched {
+        Dispatched::Answered(self.answer(method, params))
+    }
+}
+
+impl DevHost {
+    fn answer(
         &mut self,
         method: Method,
         params: serde_json::Value,

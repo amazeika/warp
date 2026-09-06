@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use extension_host::{
-    DiscoveredExtension, ExtensionHost, ExtensionProcess, ExtensionRecord, ProcessEvent, Session,
-    discover_in,
+    DiscoveredExtension, Dispatched, ExtensionHost, ExtensionProcess, ExtensionRecord,
+    ProcessEvent, Session, discover_in,
 };
 use extension_protocol::{
     ActionOrigin, Capability, EventEnvelope, EventKind, ExecutionRunResult, ExecutionTarget,
@@ -83,6 +83,17 @@ impl ExtensionHost for FakeHost {
     }
 
     fn dispatch(
+        &mut self,
+        _request_id: &str,
+        method: Method,
+        params: serde_json::Value,
+    ) -> Dispatched {
+        Dispatched::Answered(self.answer(method, params))
+    }
+}
+
+impl FakeHost {
+    fn answer(
         &mut self,
         method: Method,
         params: serde_json::Value,

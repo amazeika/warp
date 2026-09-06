@@ -306,11 +306,68 @@ Gated behind a new `FeatureFlag::Extensions`, in the style of
 ### 6a. Extension surfaces _(PR 3)_
 
 The permission prompt, the palette entries for contributed commands, and
-`dialog.confirm`. A modal answer is not available synchronously, so this is
-also where `ExtensionHost::dispatch` grows a deferred outcome — introduced
-with its first real consumer rather than ahead of one. Until this lands, an
-extension with no recorded grant stays `Inactive`: there is nowhere for the
-user to answer.
+`dialog.confirm`. Until this lands, an extension with no recorded grant stays
+`Inactive`: there is nowhere for the user to answer.
+
+- **Deferred dispatch.** `ExtensionHost::dispatch` returns `Dispatched`, either
+  `Answered` or `Deferred`, and takes the `request_id` the host owes an answer
+  for. A modal answer arrives when the user clicks, long after the call
+  returns, so `Session` writes nothing back for a deferred request and the host
+  sends the response itself. Every gate still runs first: deferral happens
+  after the protocol, handshake, capability and permission checks, so it is not
+  a way around them.
+
+- **`app/src/extensions/dialog.rs`.** One question with two answers, used by
+  both surfaces, routed to the platform's alert on macOS and to
+  `Workspace::show_native_modal` elsewhere. Warp owns the presentation in both
+  cases, which is what keeps a plugin from making an irreversible action look
+  routine.
+
+- **One question at a time.** The manager holds a queue and shows the front of
+  it. The modal surface holds a single dialog, so a second question drawn over
+  the first would replace it and the answer the plugin is blocked on would
+  never arrive. A question whose extension stops is dropped from the queue; the
+  one already on screen is neutralised in place, because it cannot be
+  withdrawn but its answer must not start a plugin or reply to a request that
+  no longer exists. When there is no window to ask in, a question resolves to
+  no rather than waiting, because a plugin is blocked on it and a confirmation
+  nobody gave is a refusal. A permission prompt is kept and retried instead:
+  extensions are discovered while Warp is still starting, before there is a
+  window to draw one in, and nothing is waiting on that question. A window is
+  required on every platform for the same reason, including the one whose alert
+  could be raised without one — a modal before the workspace has drawn would
+  make startup wait on a question about something the user has not seen yet.
+
+- **A refusal is remembered for the session.** Declining leaves the extension
+  `Inactive` and is not asked again until the user retries explicitly, and a
+  directory rescan while the prompt is up does not stack a second copy of it.
+
+- **The grant records the executables, not only the permissions.**
+  `process.execute` says nothing on its own about what may be run — the
+  allowlist is the whole of that limit — so a manifest that adds to the
+  allowlist has widened its access even though its permission set is unchanged,
+  and is prompted for again. This is what makes the prompt's "run only these
+  programs" line true across an upgrade rather than only at install.
+
+- **Palette entries.** A `SyncDataSource` over the contribution registry, filed
+  under the actions filter because a contributed command is an action and the
+  user should not have to know where it came from to find it. It reads the
+  registry per query, so an entry disappears when its extension stops rather
+  than at the next palette open, and it yields nothing in a build that never
+  registered an `ExtensionManager` — asking for an unregistered singleton
+  panics, and the palette must not be what crashes.
+
+- **Capabilities.** This PR adds `dialog.confirm.v1` and `commands.v1`. The
+  second gates no method: it is what tells a plugin that a declared command
+  will actually arrive as `command.invoked`. `dialog.input` and `dialog.select`
+  share the `dialog.confirm.v1` token, so they reach dispatch and are answered
+  `unsupported_capability` there — the right code, discovered one layer later.
+
+- **`ActionOrigin` is partly empty.** `command.invoked` carries the window it
+  was invoked from and a local execution target; the session, repository root
+  and remote target arrive with the workspace-context service in PR 5 and are
+  left unset rather than guessed, because naming the wrong target is how a
+  remote action lands on a local path.
 
 ### 7. Internal services the adapters need _(PR 5–6)_
 
@@ -368,6 +425,7 @@ Unit tests live beside the source as `<module>_tests.rs` included with
 | 36 | `logging` tests: the redacting writer drops token-shaped values and environment blocks. |
 | 7–10, 11–14 | `app/src/extensions/permissions_tests.rs` and `manager_tests.rs`: a first install prompts, a reload from disk keeps the answer, an upgrade asking for more prompts again while one asking for less does not, an unreadable grant file costs a prompt rather than granting silently, an extension with no grant is discovered but never started, and a `workspace_contains` condition stays inactive until a directory is known. The manager tests drive a real child process from a `sh` plugin, which is also the check that a plugin need not be Rust. |
 | 15, 30 | Security tests: a plugin calling an undeclared method, a malformed argv, and a request naming another extension's panel are all rejected. |
+| 11–12, 23, 35 | `manager_tests.rs` for the surfaces: the prompt is up before anything starts, allowing starts and records, declining leaves the extension inactive and survives a rescan, a retry asks again, a second dialog queues behind the first, stopping abandons what was outstanding, and a command is only delivered while its extension is running. The prompt and confirmation wording are asserted directly, including that an upgrade shows only what is new. `session_tests.rs` covers a deferred request producing no reply and still passing every gate. |
 
 Manual validation for the PRs that touch UI: the §47 end-to-end workflow run
 once against a local repository and once over an SSH session, with a screen

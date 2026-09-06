@@ -36,6 +36,16 @@ pub struct Grant {
     /// Exactly the permissions the prompt listed. A later manifest asking for
     /// more is a different question and has to be asked again.
     pub permissions: PermissionSet,
+    /// The executables the prompt promised were the only ones this extension
+    /// could run. They are recorded because `process.execute` on its own says
+    /// nothing about what may be run: the allowlist is the whole of that
+    /// limit, so a manifest that adds to it has widened its access even though
+    /// its permission set has not changed.
+    ///
+    /// Grants written before this was recorded read back empty, which costs one
+    /// prompt for an extension that runs anything — the safe direction.
+    #[serde(default)]
+    pub executables: Vec<String>,
 }
 
 /// The answer to "may this extension run right now?".
@@ -43,12 +53,15 @@ pub struct Grant {
 pub enum PermissionDecision {
     /// Everything the manifest needs has already been granted.
     Granted,
-    /// The user has to be asked. `added` is empty on a first install and names
-    /// the newly requested permissions after an upgrade, which is the part of
-    /// the prompt that actually matters to someone re-reading it.
+    /// The user has to be asked. `added` and `added_executables` are empty on a
+    /// first install and name what is newly requested after an upgrade, which
+    /// is the part of a second prompt that actually matters to someone
+    /// re-reading it.
     Prompt {
         requested: PermissionSet,
+        executables: Vec<String>,
         added: Vec<Permission>,
+        added_executables: Vec<String>,
     },
 }
 
@@ -101,20 +114,34 @@ impl GrantStore {
     /// widened them is not.
     pub fn decide(&self, manifest: &ExtensionManifest) -> PermissionDecision {
         let requested = manifest.effective_permissions();
+        let executables = manifest.execution.allowed_executables.clone();
         let Some(grant) = self.grants.get(&manifest.id) else {
             return PermissionDecision::Prompt {
                 requested,
+                executables,
                 added: Vec::new(),
+                added_executables: Vec::new(),
             };
         };
-        if grant.permissions.covers(&requested) {
-            return PermissionDecision::Granted;
-        }
-        let added = requested
+
+        let added: Vec<Permission> = requested
             .iter()
             .filter(|permission| !grant.permissions.contains(*permission))
             .collect();
-        PermissionDecision::Prompt { requested, added }
+        let added_executables: Vec<String> = executables
+            .iter()
+            .filter(|executable| !grant.executables.contains(executable))
+            .cloned()
+            .collect();
+        if added.is_empty() && added_executables.is_empty() {
+            return PermissionDecision::Granted;
+        }
+        PermissionDecision::Prompt {
+            requested,
+            executables,
+            added,
+            added_executables,
+        }
     }
 
     /// Records that the user allowed everything `manifest` asks for.
@@ -124,6 +151,7 @@ impl GrantStore {
             Grant {
                 version: manifest.version.clone(),
                 permissions: manifest.effective_permissions(),
+                executables: manifest.execution.allowed_executables.clone(),
             },
         );
         self.persist()

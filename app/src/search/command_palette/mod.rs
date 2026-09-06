@@ -1,5 +1,6 @@
 pub mod conversations;
 mod data_sources;
+pub mod extensions;
 mod files;
 mod filter_chip_renderer;
 pub mod launch_config;

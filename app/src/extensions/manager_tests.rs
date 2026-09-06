@@ -50,6 +50,22 @@ fn open_grants(root: &TempDir) -> GrantStore {
     GrantStore::load_from(root.path().join("grants.json"))
 }
 
+const COMMAND: &str = r#"
+[[commands]]
+id = "do.thing"
+title = "Do the thing"
+"#;
+
+fn confirm_params() -> DialogConfirmParams {
+    DialogConfirmParams {
+        title: "Proceed?".to_owned(),
+        body: None,
+        confirm_label: "Yes".to_owned(),
+        cancel_label: "No".to_owned(),
+        destructive: false,
+    }
+}
+
 #[test]
 fn no_activation_table_means_the_extension_is_always_eligible() {
     assert!(should_activate(None, None));
@@ -105,10 +121,288 @@ fn an_extension_without_a_grant_is_discovered_but_not_started() {
                 Some(&ExtensionState::Inactive),
                 "an extension the user has not answered for must not be running"
             );
+            assert_eq!(
+                manager.asking,
+                Some(Outcome::Permission {
+                    extension_id: "dev.warp.test".to_owned()
+                }),
+                "the prompt is the gate, so it is up before anything has started"
+            );
             assert_eq!(manager.commands().count(), 0);
             assert!(manager.rejected().is_empty());
         });
     });
+}
+
+#[test]
+fn declining_leaves_the_extension_inactive_and_is_not_asked_again() {
+    let root = install("");
+    let grant_root = TempDir::new().expect("temp dir");
+    let grants_file = grant_root.path().join("grants.json");
+
+    warpui::App::test((), |mut app| async move {
+        let manager = app.add_model(|ctx| {
+            ExtensionManager::with_paths(
+                root.path().to_path_buf(),
+                GrantStore::load_from(&grants_file),
+                ctx,
+            )
+        });
+
+        manager.update(&mut app, |manager, ctx| {
+            manager.answered(false, ctx);
+
+            assert_eq!(
+                manager.state("dev.warp.test"),
+                Some(&ExtensionState::Inactive)
+            );
+            assert!(manager.asking.is_none());
+
+            manager.refresh(ctx);
+            assert!(
+                manager.asking.is_none() && manager.questions.is_empty(),
+                "a refusal is an answer; rescanning the directory must not ask again"
+            );
+        });
+
+        assert!(
+            GrantStore::load_from(&grants_file)
+                .granted("dev.warp.test")
+                .is_none(),
+            "declining records nothing"
+        );
+    });
+}
+
+#[test]
+fn allowing_the_prompt_starts_the_extension() {
+    let root = install("");
+    let grant_root = TempDir::new().expect("temp dir");
+    let grants_file = grant_root.path().join("grants.json");
+
+    warpui::App::test((), |mut app| async move {
+        let manager = app.add_model(|ctx| {
+            ExtensionManager::with_paths(
+                root.path().to_path_buf(),
+                GrantStore::load_from(&grants_file),
+                ctx,
+            )
+        });
+
+        manager.update(&mut app, |manager, ctx| {
+            manager.answered(true, ctx);
+            assert_eq!(
+                manager.state("dev.warp.test"),
+                Some(&ExtensionState::Starting)
+            );
+            assert!(manager.asking.is_none());
+        });
+
+        assert!(
+            GrantStore::load_from(&grants_file)
+                .granted("dev.warp.test")
+                .is_some()
+        );
+
+        manager.update(&mut app, |manager, ctx| manager.stop_all(ctx));
+    });
+}
+
+#[test]
+fn retrying_asks_again_after_a_decline() {
+    let root = install("");
+    let grant_root = TempDir::new().expect("temp dir");
+
+    warpui::App::test((), |mut app| async move {
+        let manager = app.add_model(|ctx| {
+            ExtensionManager::with_paths(root.path().to_path_buf(), open_grants(&grant_root), ctx)
+        });
+
+        manager.update(&mut app, |manager, ctx| {
+            manager.answered(false, ctx);
+            manager.retry("dev.warp.test", ctx);
+            assert_eq!(
+                manager.asking,
+                Some(Outcome::Permission {
+                    extension_id: "dev.warp.test".to_owned()
+                }),
+                "coming back to the extension deliberately is the way past a refusal"
+            );
+        });
+    });
+}
+
+#[test]
+fn a_rescan_while_the_prompt_is_up_does_not_stack_a_second_one() {
+    let root = install("");
+    let grant_root = TempDir::new().expect("temp dir");
+
+    warpui::App::test((), |mut app| async move {
+        let manager = app.add_model(|ctx| {
+            ExtensionManager::with_paths(root.path().to_path_buf(), open_grants(&grant_root), ctx)
+        });
+
+        manager.update(&mut app, |manager, ctx| {
+            manager.refresh(ctx);
+            manager.refresh(ctx);
+            assert!(
+                manager.questions.is_empty(),
+                "the same extension must not queue a second copy of the question already on screen"
+            );
+        });
+    });
+}
+
+#[test]
+fn a_dialog_is_answered_back_to_the_plugin_and_lets_the_next_question_through() {
+    let root = install("");
+    let grant_root = TempDir::new().expect("temp dir");
+
+    warpui::App::test((), |mut app| async move {
+        let manager = app.add_model(|ctx| {
+            ExtensionManager::with_paths(root.path().to_path_buf(), open_grants(&grant_root), ctx)
+        });
+
+        manager.update(&mut app, |manager, ctx| {
+            manager.answered(true, ctx);
+
+            manager.confirm("dev.warp.test", "7".to_owned(), confirm_params(), ctx);
+            manager.confirm("dev.warp.test", "8".to_owned(), confirm_params(), ctx);
+            assert_eq!(
+                manager.asking,
+                Some(Outcome::Dialog {
+                    extension_id: "dev.warp.test".to_owned(),
+                    request_id: "7".to_owned()
+                })
+            );
+            assert_eq!(
+                manager.questions.len(),
+                1,
+                "one modal at a time, or the second replaces the first and its answer never arrives"
+            );
+
+            manager.answered(true, ctx);
+            assert_eq!(
+                manager.asking,
+                Some(Outcome::Dialog {
+                    extension_id: "dev.warp.test".to_owned(),
+                    request_id: "8".to_owned()
+                })
+            );
+
+            manager.answered(false, ctx);
+            assert!(manager.asking.is_none());
+        });
+
+        manager.update(&mut app, |manager, ctx| manager.stop_all(ctx));
+    });
+}
+
+#[test]
+fn stopping_an_extension_abandons_the_questions_it_was_waiting_on() {
+    let root = install("");
+    let grant_root = TempDir::new().expect("temp dir");
+
+    warpui::App::test((), |mut app| async move {
+        let manager = app.add_model(|ctx| {
+            ExtensionManager::with_paths(root.path().to_path_buf(), open_grants(&grant_root), ctx)
+        });
+
+        manager.update(&mut app, |manager, ctx| {
+            manager.answered(true, ctx);
+            manager.confirm("dev.warp.test", "7".to_owned(), confirm_params(), ctx);
+            manager.confirm("dev.warp.test", "8".to_owned(), confirm_params(), ctx);
+
+            manager.stop("dev.warp.test", StopReason::Requested, ctx);
+            assert!(
+                manager.questions.is_empty(),
+                "a question for an extension that is gone has nothing left to ask about"
+            );
+            assert_eq!(
+                manager.asking,
+                Some(Outcome::Abandoned),
+                "the modal already on screen cannot be withdrawn, so its answer is neutralised"
+            );
+
+            manager.answered(true, ctx);
+            assert!(manager.asking.is_none());
+        });
+    });
+}
+
+#[test]
+fn a_command_is_only_delivered_while_its_extension_is_running() {
+    let root = install(COMMAND);
+    let grant_root = TempDir::new().expect("temp dir");
+
+    warpui::App::test((), |mut app| async move {
+        let manager = app.add_model(|ctx| {
+            ExtensionManager::with_paths(root.path().to_path_buf(), open_grants(&grant_root), ctx)
+        });
+
+        manager.update(&mut app, |manager, ctx| {
+            // Nothing is registered until the handshake completes, so a palette
+            // entry cannot exist yet — and invoking one is a no-op rather than a
+            // message written to a plugin that has not said hello.
+            assert_eq!(manager.commands().count(), 0);
+            manager.invoke_command("dev.warp.test", "do.thing", ctx);
+            manager.invoke_command("dev.warp.test", "not.declared", ctx);
+        });
+    });
+}
+
+#[test]
+fn a_first_prompt_lists_everything_and_an_upgrade_lists_only_what_is_new() {
+    let requested: PermissionSet = [Permission::ProcessExecute, Permission::UiDialogs]
+        .into_iter()
+        .collect();
+    let executables = vec!["git".to_owned()];
+
+    let first = permission_question("Warp Git", &requested, &executables, &[], &[]);
+    assert_eq!(first.title, "Allow Warp Git to run?");
+    assert!(
+        first
+            .body
+            .contains(Permission::ProcessExecute.description())
+    );
+    assert!(first.body.contains(Permission::UiDialogs.description()));
+    assert!(first.body.contains("Run only these programs: git"));
+
+    let upgrade = permission_question(
+        "Warp Git",
+        &requested,
+        &executables,
+        &[Permission::UiDialogs],
+        &[],
+    );
+    assert_eq!(upgrade.title, "Warp Git is asking for more access");
+    assert!(upgrade.body.contains(Permission::UiDialogs.description()));
+    assert!(
+        !upgrade
+            .body
+            .contains(Permission::ProcessExecute.description()),
+        "asking a second time is about the difference; repeating the rest is how a prompt \
+         stops being read"
+    );
+}
+
+#[test]
+fn a_destructive_confirmation_says_so_and_names_the_extension() {
+    let question = confirm_question(
+        "Warp Git",
+        DialogConfirmParams {
+            title: "Discard changes to main.rs?".to_owned(),
+            body: Some("3 lines will be lost.".to_owned()),
+            confirm_label: "Discard".to_owned(),
+            cancel_label: "Keep".to_owned(),
+            destructive: true,
+        },
+    );
+    assert_eq!(question.title, "Warp Git: Discard changes to main.rs?");
+    assert!(question.body.contains("3 lines will be lost."));
+    assert!(question.body.contains("This cannot be undone."));
+    assert_eq!(question.confirm_label, "Discard");
+    assert_eq!(question.cancel_label, "Keep");
 }
 
 #[test]

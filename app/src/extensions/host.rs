@@ -4,10 +4,10 @@
 //! borrows the live model context. Nothing here re-checks whether the extension
 //! was allowed to ask — `Session` has already applied the protocol, capability
 //! and permission gates by the time a call arrives.
-use extension_host::ExtensionHost;
+use extension_host::{Dispatched, ExtensionHost};
 use extension_protocol::{
-    Capability, ErrorCode, ExtensionError, Method, NotificationLevel, NotificationParams,
-    decode_params,
+    Capability, DialogConfirmParams, ErrorCode, ExtensionError, Method, NotificationLevel,
+    NotificationParams, decode_params,
 };
 use warpui::windowing::WindowManager;
 use warpui::{ModelContext, SingletonEntity as _};
@@ -21,13 +21,34 @@ use crate::workspace::{ToastStack, WorkspaceAction};
 /// Advertising a capability Warp cannot honour would be worse than omitting it:
 /// a plugin that sees the token stops offering the user a fallback. The list
 /// grows as each surface is wired up.
-pub(super) const IMPLEMENTED_CAPABILITIES: &[Capability] = &[Capability::NotificationV1];
+/// `commands.v1` is here even though no method requires it: it is what tells a
+/// plugin that a declared command will actually reach it as `command.invoked`,
+/// which is the only way a plugin can know whether to offer that entry point.
+pub(super) const IMPLEMENTED_CAPABILITIES: &[Capability] = &[
+    Capability::CommandsV1,
+    Capability::NotificationV1,
+    Capability::DialogConfirmV1,
+];
 
 pub(super) struct BridgeHost<'a, 'ctx> {
+    pub extension_id: String,
     /// Shown as the notification's source, so a message a user did not expect
     /// names the extension that produced it rather than appearing to be Warp.
     pub extension_name: String,
     pub ctx: &'a mut ModelContext<'ctx, ExtensionManager>,
+    /// A question raised by this dispatch, for the manager to queue once its
+    /// own borrow of the extension has ended.
+    ///
+    /// It cannot be queued from here: the manager is already borrowed by the
+    /// call that is being dispatched, which is the same reason this host exists
+    /// only for the length of one call.
+    pub question: Option<PendingConfirm>,
+}
+
+/// A `dialog.confirm` waiting to be put in front of the user.
+pub(super) struct PendingConfirm {
+    pub request_id: String,
+    pub params: DialogConfirmParams,
 }
 
 impl ExtensionHost for BridgeHost<'_, '_> {
@@ -37,27 +58,46 @@ impl ExtensionHost for BridgeHost<'_, '_> {
 
     fn dispatch(
         &mut self,
+        request_id: &str,
         method: Method,
         params: serde_json::Value,
-    ) -> Result<serde_json::Value, ExtensionError> {
+    ) -> Dispatched {
         match method {
-            Method::NotificationShow => self.show_notification(decode_params(method, &params)?),
-            // Every other method is gated by a capability this build does not
-            // advertise, so `Session` refuses it before dispatch. Answering
-            // here as well keeps the failure honest if that ever changes.
+            Method::NotificationShow => Dispatched::Answered(
+                decode_params(method, &params).and_then(|params| self.show_notification(params)),
+            ),
+            // The answer arrives when the user clicks, which is long after this
+            // returns, so nothing is written back here.
+            Method::DialogConfirm => match decode_params(method, &params) {
+                Ok(params) => {
+                    self.question = Some(PendingConfirm {
+                        request_id: request_id.to_owned(),
+                        params,
+                    });
+                    Dispatched::Deferred
+                }
+                Err(error) => Dispatched::Answered(Err(error)),
+            },
+            // `dialog.input` and `dialog.select` share the `dialog.confirm.v1`
+            // token with the method above, so they reach dispatch rather than
+            // being refused by the capability gate. The code is still the right
+            // one: this build does not implement them.
+            //
+            // Everything else is gated by a capability this build does not
+            // advertise at all, so `Session` refuses it before dispatch.
+            // Answering here as well keeps the failure honest if that changes.
             Method::ExtensionInitialize
             | Method::WorkspaceGetContext
             | Method::ExecutionRun
             | Method::FileOpen
             | Method::DiffOpenWorkingTree
             | Method::DiffOpenFile
-            | Method::DialogConfirm
             | Method::DialogInput
             | Method::DialogSelect
-            | Method::PanelSetState => Err(ExtensionError::new(
+            | Method::PanelSetState => Dispatched::Answered(Err(ExtensionError::new(
                 ErrorCode::UnsupportedCapability,
                 format!("{method} is not implemented by this Warp build"),
-            )),
+            ))),
         }
     }
 }

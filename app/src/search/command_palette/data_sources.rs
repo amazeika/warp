@@ -11,6 +11,7 @@ use crate::drive::settings::WarpDriveSettings;
 use crate::search::QueryFilter;
 use crate::search::action::CommandBindingDataSource;
 use crate::search::binding_source::BindingSource;
+use crate::search::command_palette::extensions::ExtensionCommandDataSource;
 use crate::search::command_palette::mixer::{CommandPaletteItemAction, ItemSummary};
 use crate::search::command_palette::new_session::NewSessionDataSource;
 use crate::search::command_palette::repos::RepoDataSource;
@@ -31,6 +32,7 @@ pub struct DataSourceStore {
     all_conversation_data_source: ModelHandle<conversations::DataSource>,
     repo_data_source: ModelHandle<RepoDataSource>,
     tabs_data_source: Option<ModelHandle<tabs::DataSource>>,
+    extension_command_data_source: ModelHandle<ExtensionCommandDataSource>,
 }
 
 impl DataSourceStore {
@@ -60,6 +62,8 @@ impl DataSourceStore {
 
         let repo_data_source = ctx.add_model(|_| RepoDataSource::new());
 
+        let extension_command_data_source = ctx.add_model(|_| ExtensionCommandDataSource::new());
+
         Self {
             actions_data_source,
             sessions_data_source,
@@ -69,6 +73,7 @@ impl DataSourceStore {
             all_conversation_data_source,
             repo_data_source,
             tabs_data_source: None,
+            extension_command_data_source,
         }
     }
 
@@ -154,6 +159,14 @@ impl DataSourceStore {
             mixer.add_sync_source(
                 self.repo_data_source.clone(),
                 HashSet::from([QueryFilter::Repos]),
+            );
+
+            // Filed under actions because that is what a contributed command
+            // is: the palette should not make the user learn that this one came
+            // from an extension in order to find it.
+            mixer.add_sync_source(
+                self.extension_command_data_source.clone(),
+                HashSet::from([QueryFilter::Actions]),
             );
 
             ctx.notify();
@@ -286,6 +299,11 @@ impl DataSourceStore {
                 None
             }
             ItemSummary::Conversation { id } => conversations::DataSource::query_result(id, app),
+
+            ItemSummary::ExtensionCommand {
+                extension_id,
+                command_id,
+            } => ExtensionCommandDataSource::query_result(extension_id, command_id, app),
 
             ItemSummary::NewConversation => {
                 // The new conversation item should not show up in the recent command list,
