@@ -266,6 +266,7 @@ impl Harness {
                     }
                 }
                 Ok(ProcessEvent::Decode(error)) => panic!("the plugin sent a bad frame: {error}"),
+                Ok(ProcessEvent::Stderr(_)) => continue,
                 Ok(ProcessEvent::Closed) => break,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -295,6 +296,7 @@ impl Harness {
                     }
                 }
                 Ok(ProcessEvent::Decode(error)) => panic!("the plugin sent a bad frame: {error}"),
+                Ok(ProcessEvent::Stderr(_)) => continue,
                 Ok(ProcessEvent::Closed) => return,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     if saw_activity && Instant::now().duration_since(last_activity) >= QUIET {
@@ -641,6 +643,7 @@ fn a_workspace_without_a_repository_is_reported_as_empty() {
                 }
             }
             Ok(ProcessEvent::Decode(error)) => panic!("the plugin sent a bad frame: {error}"),
+            Ok(ProcessEvent::Stderr(_)) => continue,
             Ok(ProcessEvent::Closed) => break,
             // A poll that found nothing is not the plugin going away.
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,

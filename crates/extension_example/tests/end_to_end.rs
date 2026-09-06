@@ -200,6 +200,7 @@ impl Harness {
                     }
                 }
                 Ok(ProcessEvent::Decode(error)) => panic!("the plugin sent a bad frame: {error}"),
+                Ok(ProcessEvent::Stderr(_)) => continue,
                 Ok(ProcessEvent::Closed) => {
                     self.closed = true;
                     if done(self) {

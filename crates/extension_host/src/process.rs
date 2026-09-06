@@ -35,13 +35,19 @@ pub enum ProcessError {
     NotRunning,
 }
 
-/// Something that arrived from the plugin's stdout.
+/// Something that arrived from the plugin.
 #[derive(Debug)]
 pub enum ProcessEvent {
     Message(Box<Message>),
     /// A frame that could not be used. The connection survives a single bad
     /// frame; the supervisor decides when a run of them is a violation.
     Decode(CodecError),
+    /// One line the plugin wrote to stderr.
+    ///
+    /// Surfaced as an event rather than only written to the log, because a
+    /// plugin that fails during startup says why on stderr and that is the
+    /// message a user needs to see.
+    Stderr(String),
     /// stdout reached end of file: the plugin is finished talking.
     Closed,
 }
@@ -87,6 +93,7 @@ impl ExtensionProcess {
         let stderr = child.stderr.take().ok_or(ProcessError::MissingStdio)?;
 
         let (sender, events) = channel();
+        let stderr_sender = sender.clone();
         let reader = std::thread::Builder::new()
             .name(format!("warp-extension-{extension_id}-stdout"))
             .spawn(move || read_loop(BufReader::new(stdout), sender))
@@ -95,7 +102,7 @@ impl ExtensionProcess {
         let stderr_log = log_path.map(Path::to_path_buf);
         let stderr = std::thread::Builder::new()
             .name(format!("warp-extension-{extension_id}-stderr"))
-            .spawn(move || drain_stderr(BufReader::new(stderr), stderr_log))
+            .spawn(move || drain_stderr(BufReader::new(stderr), stderr_log, stderr_sender))
             .ok();
 
         Ok(Self {
@@ -197,7 +204,11 @@ fn read_loop(mut reader: impl std::io::BufRead, sender: Sender<ProcessEvent>) {
     }
 }
 
-fn drain_stderr(reader: impl std::io::BufRead, log_path: Option<PathBuf>) {
+fn drain_stderr(
+    reader: impl std::io::BufRead,
+    log_path: Option<PathBuf>,
+    sender: Sender<ProcessEvent>,
+) {
     let mut log = log_path.and_then(|path| {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok()?;
@@ -211,9 +222,12 @@ fn drain_stderr(reader: impl std::io::BufRead, log_path: Option<PathBuf>) {
     });
 
     for line in reader.lines() {
-        let Ok(line) = line else { return };
+        let Ok(line) = line else { break };
         if let Some(log) = log.as_mut() {
             let _ = log.write_line(&line);
+        }
+        if sender.send(ProcessEvent::Stderr(line)).is_err() {
+            break;
         }
     }
     if let Some(log) = log.as_mut() {
