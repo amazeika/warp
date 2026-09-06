@@ -135,7 +135,8 @@ fn context() -> WorkspaceContext {
 
 struct Harness {
     process: ExtensionProcess,
-    session: Session<FakeHost>,
+    session: Session,
+    host: FakeHost,
     calls: Arc<Mutex<Vec<Call>>>,
     closed: bool,
     _root: TempDir,
@@ -151,16 +152,15 @@ impl Harness {
         let process = ExtensionProcess::spawn("dev.warp.example", executable, &directory, None)
             .expect("the plugin starts");
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let session = Session::new(
-            manifest.clone(),
-            FakeHost {
-                context: context(),
-                calls: Arc::clone(&calls),
-            },
-        );
+        let session = Session::new(manifest.clone());
+        let host = FakeHost {
+            context: context(),
+            calls: Arc::clone(&calls),
+        };
         Self {
             process,
             session,
+            host,
             calls,
             closed: false,
             _root: root,
@@ -195,7 +195,7 @@ impl Harness {
             }
             match self.process.recv_timeout(POLL_INTERVAL) {
                 Ok(ProcessEvent::Message(message)) => {
-                    if let Some(reply) = self.session.handle_message(*message) {
+                    if let Some(reply) = self.session.handle_message(*message, &mut self.host) {
                         self.process.send(&reply).expect("the reply is written");
                     }
                 }

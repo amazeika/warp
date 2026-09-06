@@ -56,7 +56,7 @@ pub enum ProcessEvent {
 pub struct ExtensionProcess {
     child: Child,
     stdin: Option<BufWriter<ChildStdin>>,
-    events: Receiver<ProcessEvent>,
+    events: Option<Receiver<ProcessEvent>>,
     reader: Option<JoinHandle<()>>,
     stderr: Option<JoinHandle<()>>,
 }
@@ -108,7 +108,7 @@ impl ExtensionProcess {
         Ok(Self {
             child,
             stdin: Some(BufWriter::new(stdin)),
-            events,
+            events: Some(events),
             reader,
             stderr,
         })
@@ -120,7 +120,20 @@ impl ExtensionProcess {
     }
 
     pub fn recv_timeout(&self, timeout: Duration) -> Result<ProcessEvent, RecvTimeoutError> {
-        self.events.recv_timeout(timeout)
+        let Some(events) = self.events.as_ref() else {
+            return Err(RecvTimeoutError::Disconnected);
+        };
+        events.recv_timeout(timeout)
+    }
+
+    /// Hands the event stream to a caller that will drain it elsewhere.
+    ///
+    /// Warp reads a plugin on a background thread but writes to it from the
+    /// main thread, so the two halves have to be owned separately; taking the
+    /// receiver is what allows that without a lock the reader would hold for
+    /// as long as it blocks.
+    pub fn take_events(&mut self) -> Option<Receiver<ProcessEvent>> {
+        self.events.take()
     }
 
     /// Returns the child's exit status if it has already exited.

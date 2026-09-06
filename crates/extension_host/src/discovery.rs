@@ -7,12 +7,17 @@ use extension_protocol::{ExtensionManifest, MANIFEST_FILE_NAME, ManifestError};
 /// Overrides the extensions root, used by tests and packaging.
 pub const EXTENSIONS_DIR_ENV: &str = "WARP_EXTENSIONS_DIR";
 
+/// Warp's per-user data directory.
+pub fn warp_home() -> PathBuf {
+    home_dir().join(".warp")
+}
+
 /// Where Warp looks for installed extensions.
 pub fn extensions_root() -> PathBuf {
     if let Some(path) = std::env::var_os(EXTENSIONS_DIR_ENV) {
         return PathBuf::from(path);
     }
-    home_dir().join(".warp").join("extensions")
+    warp_home().join("extensions")
 }
 
 pub(crate) fn home_dir() -> PathBuf {

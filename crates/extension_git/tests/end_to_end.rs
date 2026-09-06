@@ -192,7 +192,8 @@ impl ExtensionHost for GitHost {
 
 struct Harness {
     process: ExtensionProcess,
-    session: Session<GitHost>,
+    session: Session,
+    host: GitHost,
     recorded: Arc<Mutex<Recorded>>,
     dialog_answers: Arc<Mutex<VecDeque<serde_json::Value>>>,
     repo: PathBuf,
@@ -210,17 +211,16 @@ impl Harness {
             .expect("the plugin starts");
         let recorded = Arc::new(Mutex::new(Recorded::default()));
         let dialog_answers = Arc::new(Mutex::new(VecDeque::new()));
-        let session = Session::new(
-            manifest,
-            GitHost {
-                repo: repo.path().to_path_buf(),
-                recorded: Arc::clone(&recorded),
-                dialog_answers: Arc::clone(&dialog_answers),
-            },
-        );
+        let session = Session::new(manifest);
+        let host = GitHost {
+            repo: repo.path().to_path_buf(),
+            recorded: Arc::clone(&recorded),
+            dialog_answers: Arc::clone(&dialog_answers),
+        };
         Self {
             process,
             session,
+            host,
             recorded,
             dialog_answers,
             repo: repo.path().to_path_buf(),
@@ -261,7 +261,7 @@ impl Harness {
             }
             match self.process.recv_timeout(POLL_INTERVAL) {
                 Ok(ProcessEvent::Message(message)) => {
-                    if let Some(reply) = self.session.handle_message(*message) {
+                    if let Some(reply) = self.session.handle_message(*message, &mut self.host) {
                         self.process.send(&reply).expect("the reply is written");
                     }
                 }
@@ -291,7 +291,7 @@ impl Harness {
                 Ok(ProcessEvent::Message(message)) => {
                     saw_activity = true;
                     last_activity = Instant::now();
-                    if let Some(reply) = self.session.handle_message(*message) {
+                    if let Some(reply) = self.session.handle_message(*message, &mut self.host) {
                         self.process.send(&reply).expect("the reply is written");
                     }
                 }
@@ -617,13 +617,11 @@ fn a_workspace_without_a_repository_is_reported_as_empty() {
     )
     .expect("the plugin starts");
     let recorded = Arc::new(Mutex::new(Recorded::default()));
-    let mut session = Session::new(
-        manifest,
-        NoRepositoryHost {
-            cwd: cwd.path().to_path_buf(),
-            recorded: Arc::clone(&recorded),
-        },
-    );
+    let mut session = Session::new(manifest);
+    let mut host = NoRepositoryHost {
+        cwd: cwd.path().to_path_buf(),
+        recorded: Arc::clone(&recorded),
+    };
 
     let deadline = Instant::now() + PUMP_TIMEOUT;
     while Instant::now() < deadline {
@@ -638,7 +636,7 @@ fn a_workspace_without_a_repository_is_reported_as_empty() {
         }
         match process.recv_timeout(POLL_INTERVAL) {
             Ok(ProcessEvent::Message(message)) => {
-                if let Some(reply) = session.handle_message(*message) {
+                if let Some(reply) = session.handle_message(*message, &mut host) {
                     process.send(&reply).expect("reply is written");
                 }
             }

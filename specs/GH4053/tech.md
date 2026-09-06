@@ -257,24 +257,62 @@ Structure:
 - `repository.rs` — runs Git through `execution.run`, bound to the target and
   root it was constructed with.
 
-### 6. App-side bridge — `app/src/extensions/` _(PR 2–5)_
+### 6. App-side host — `app/src/extensions/` _(PR 2)_
 
-Mirrors `app/src/local_control/`:
+Mirrors `app/src/local_control/`, and is deliberately unrelated to
+`app/src/plugin/`, which is Warp's internal JavaScript host for shell
+completions: that one runs Warp's own code, this one runs the user's.
 
-- `manager.rs` — an `ExtensionManager` singleton entity owning discovered
-  extensions, their processes, and activation evaluation against workspace
-  events.
-- `bridge.rs` — `ModelSpawner<ExtensionBridge>` to move inbound requests onto
-  the main thread, following `app/src/local_control/bridge.rs:21`.
-- `permissions.rs` — the grant store and the permission prompt, gated behind a
-  new `FeatureFlag::Extensions` in the style of
-  `app/src/features.rs:465`.
+- `manager.rs` — the `ExtensionManager` singleton entity. It owns every
+  discovered extension, its process handle and its `Session`, evaluates
+  activation, and applies the restart policy. It lives on the main thread, so
+  extension state needs no locking.
+- `permissions.rs` — the grant store, behind an explicit path rather than a
+  setting: a grant records a decision about one installed binary, and the
+  extension with the same id on another machine is not necessarily the same
+  code. A manifest that has narrowed its permissions stays covered by the
+  original grant; one that widened them is prompted for again, reporting only
+  what was added.
 - `contributions.rs` — the registry of commands and panels contributed by
   running extensions, consulted by the command palette and the panel switcher.
-- `adapters/` — the `ExtensionHost` implementation, translating protocol types
-  into existing app services.
+  Entries appear when an extension reaches `Running` and vanish when it stops,
+  so a palette entry never invokes a plugin that is not there to answer.
+- `host.rs` — the `ExtensionHost` implementation, constructed for the duration
+  of one dispatch because it borrows the live model context.
 
-### 7. Internal services the adapters need _(PR 4–5)_
+Threading. Each running plugin gets one *pump* thread that owns the receiving
+half of its event channel and forwards every message to the main thread through
+a `ModelSpawner<ExtensionManager>`, following
+`app/src/local_control/bridge.rs:21`. Reading has to be off the main thread
+because it blocks; everything else — gating, dispatch, and the write back —
+happens on the main thread. The pump is never joined while handling an event:
+a stop is normally decided *inside* a dispatch the pump is still blocked on, so
+joining from there would deadlock. Dropping the process closes the channel,
+which is what ends the thread.
+
+This is what moved `ExtensionHost` from a field of `Session` to a parameter of
+its methods (§2). The app-side implementation borrows application state and
+therefore cannot outlive one call, so a session that owned its host could not
+be stored next to the process it belongs to.
+
+Warp advertises only the capabilities it actually implements. A build that
+claimed a capability it cannot honour would be worse than one that stays quiet:
+a plugin that sees the token stops offering the user a fallback. `PR 2` ships
+`notification.v1`; the rest arrive with their surfaces.
+
+Gated behind a new `FeatureFlag::Extensions`, in the style of
+`app/src/features.rs:465`.
+
+### 6a. Extension surfaces _(PR 3)_
+
+The permission prompt, the palette entries for contributed commands, and
+`dialog.confirm`. A modal answer is not available synchronously, so this is
+also where `ExtensionHost::dispatch` grows a deferred outcome — introduced
+with its first real consumer rather than ahead of one. Until this lands, an
+extension with no recorded grant stays `Inactive`: there is nowhere for the
+user to answer.
+
+### 7. Internal services the adapters need _(PR 5–6)_
 
 - **`ExecutionService`** — resolves `ExecutionTarget::Local` to a spawned
   process and `ExecutionTarget::Ssh { session_id }` to
@@ -328,6 +366,7 @@ Unit tests live beside the source as `<module>_tests.rs` included with
 | 27–32 | Adapter tests with a fake `ExecutionService`: context assembly local and SSH, a stale session yields `session_disconnected`, target retained across a focus change, output truncation flagged. |
 | 33–35 | Adapter tests asserting the app service each method calls, and that a remote path routes through the remote transport. |
 | 36 | `logging` tests: the redacting writer drops token-shaped values and environment blocks. |
+| 7–10, 11–14 | `app/src/extensions/permissions_tests.rs` and `manager_tests.rs`: a first install prompts, a reload from disk keeps the answer, an upgrade asking for more prompts again while one asking for less does not, an unreadable grant file costs a prompt rather than granting silently, an extension with no grant is discovered but never started, and a `workspace_contains` condition stays inactive until a directory is known. The manager tests drive a real child process from a `sh` plugin, which is also the check that a plugin need not be Rust. |
 | 15, 30 | Security tests: a plugin calling an undeclared method, a malformed argv, and a request naming another extension's panel are all rejected. |
 
 Manual validation for the PRs that touch UI: the §47 end-to-end workflow run
@@ -342,12 +381,21 @@ Per §45 of the plan, and matching the repo's preference for focused PRs:
 1. **PR 1 — foundation.** `extension_protocol`, `extension_host`,
    `extension_sdk`, `extension_example`, `extension_git`. No app changes and no
    UI; the Git plugin is a separate process that Warp core knows nothing about.
-2. **PR 2 — commands, notifications, dialogs.** First app wiring:
-   `ExtensionManager`, the bridge, permission prompt, contribution registry.
-3. **PR 3 — panel API.** The `ToolPanelView` registry refactor.
-4. **PR 4 — workspace context and execution targets.** `WorkspaceContextService`,
+2. **PR 2 — the app-side host.** `ExtensionManager`, the pump threads, the
+   grant store, the contribution registry, and `notification.show`. No new
+   views, so nothing here can regress an existing surface.
+3. **PR 3 — the surfaces that ask and invoke.** Permission prompt, contributed
+   commands in the command palette, `dialog.confirm`.
+4. **PR 4 — panel API.** The `ToolPanelView` registry refactor.
+5. **PR 5 — workspace context and execution targets.** `WorkspaceContextService`,
    `ExecutionService`, session-staleness handling.
-5. **PR 5 — diff and file wrappers.** `DiffService`, `file.open`.
+6. **PR 6 — diff and file wrappers.** `DiffService`, `file.open`.
+
+PR 2 was split out of the original PR 2 once it was clear the palette is built
+from static `EditableBinding`s (`app/src/workspace/mod.rs:866`) rather than a
+registry: contributing a command dynamically is its own change, closer in size
+to the panel refactor than to the host wiring, and landing the host first keeps
+the two bisectable.
 
 PRs 2–5 depend on PR 1 only through `extension_protocol`, so the external
 `warp-git` plugin can be developed against the protocol crate in parallel from

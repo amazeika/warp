@@ -18,7 +18,7 @@ pub mod session;
 pub use codec::{CodecError, MAX_MESSAGE_BYTES, read_message, write_message};
 pub use discovery::{
     DiscoveredExtension, ExtensionRecord, ValidationError, discover, discover_in,
-    extension_directory_is_candidate, extensions_root,
+    extension_directory_is_candidate, extensions_root, warp_home,
 };
 pub use lifecycle::{ExtensionState, RestartDecision, RestartPolicy, StateMachine, StopReason};
 pub use logging::{RedactingWriter, extension_log_path, extension_log_path_in, extension_log_root};

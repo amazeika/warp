@@ -34,6 +34,12 @@ mod drive;
 mod dynamic_libraries;
 mod env_vars;
 mod experiments;
+// The manager and its surfaces land in separate changes: everything the
+// permission prompt, command palette and panel switcher will call already
+// exists and is tested, but nothing in the UI calls it yet.
+#[allow(dead_code)]
+#[cfg(feature = "local_fs")]
+mod extensions;
 mod external_secrets;
 #[cfg(target_family = "wasm")]
 mod font_fallback;
@@ -2600,6 +2606,14 @@ pub(crate) fn initialize_app(
     {
         ctx.add_singleton_model(local_control::LocalControlBridge::new);
         ctx.add_singleton_model(local_control::LocalControlServer::new);
+    }
+    #[cfg(feature = "local_fs")]
+    if matches!(
+        launch_mode,
+        LaunchMode::App { .. } | LaunchMode::Test { .. }
+    ) && FeatureFlag::Extensions.is_enabled()
+    {
+        ctx.add_singleton_model(extensions::ExtensionManager::new);
     }
 
     app_state

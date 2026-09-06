@@ -15303,6 +15303,8 @@ dependencies = [
  "enum-iterator",
  "env_logger",
  "event-listener",
+ "extension_host",
+ "extension_protocol",
  "field_mask",
  "firebase",
  "float-cmp",

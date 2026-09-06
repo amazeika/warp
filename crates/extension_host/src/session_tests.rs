@@ -68,11 +68,33 @@ fn manifest() -> ExtensionManifest {
     manifest
 }
 
-fn session(host: RecordingHost) -> Session<RecordingHost> {
-    Session::new(manifest(), host)
+/// A session and the host it dispatches into.
+///
+/// The session no longer owns its host, so the tests hold the pair together to
+/// keep asserting what did and did not reach the host side of a gate.
+struct Connected {
+    session: Session,
+    host: RecordingHost,
 }
 
-fn initialized_session(host: RecordingHost) -> Session<RecordingHost> {
+impl Connected {
+    fn is_initialized(&self) -> bool {
+        self.session.is_initialized()
+    }
+
+    fn handle(&mut self, message: Message) -> Option<Message> {
+        self.session.handle_message(message, &mut self.host)
+    }
+}
+
+fn session(host: RecordingHost) -> Connected {
+    Connected {
+        session: Session::new(manifest()),
+        host,
+    }
+}
+
+fn initialized_session(host: RecordingHost) -> Connected {
     let mut session = session(host);
     let reply = request(
         &mut session,
@@ -83,13 +105,9 @@ fn initialized_session(host: RecordingHost) -> Session<RecordingHost> {
     session
 }
 
-fn request(
-    session: &mut Session<RecordingHost>,
-    method: Method,
-    params: serde_json::Value,
-) -> ResponsePayload {
+fn request(session: &mut Connected, method: Method, params: serde_json::Value) -> ResponsePayload {
     let message = Message::Request(RequestEnvelope::new("1", method, params));
-    let Some(Message::Response(response)) = session.handle_message(message) else {
+    let Some(Message::Response(response)) = session.handle(message) else {
         panic!("a request must produce a response");
     };
     response.payload
@@ -158,7 +176,7 @@ fn calls_before_the_handshake_are_refused() {
     let mut session = session(RecordingHost::with_all_capabilities());
     let payload = request(&mut session, Method::WorkspaceGetContext, json!({}));
     assert_eq!(error_code(payload), ErrorCode::InvalidRequest);
-    assert!(session.host_mut().dispatched.is_empty());
+    assert!(session.host.dispatched.is_empty());
 }
 
 #[test]
@@ -167,8 +185,7 @@ fn a_wrong_protocol_version_is_rejected_before_anything_else() {
     let mut envelope = RequestEnvelope::new("1", Method::ExtensionInitialize, json!({}));
     envelope.protocol = 99;
 
-    let Some(Message::Response(response)) = session.handle_message(Message::Request(envelope))
-    else {
+    let Some(Message::Response(response)) = session.handle(Message::Request(envelope)) else {
         panic!("a request must produce a response");
     };
     assert_eq!(error_code(response.payload), ErrorCode::ProtocolMismatch);
@@ -179,7 +196,7 @@ fn a_granted_method_reaches_the_host() {
     let mut session = initialized_session(RecordingHost::with_all_capabilities());
     let payload = request(&mut session, Method::WorkspaceGetContext, json!({}));
     assert!(matches!(payload, ResponsePayload::Ok { .. }));
-    assert_eq!(session.host_mut().dispatched, [Method::WorkspaceGetContext]);
+    assert_eq!(session.host.dispatched, [Method::WorkspaceGetContext]);
 }
 
 #[test]
@@ -191,7 +208,7 @@ fn an_undeclared_permission_is_denied_without_reaching_the_host() {
         json!({ "title": "hello", "level": "info" }),
     );
     assert_eq!(error_code(payload), ErrorCode::PermissionDenied);
-    assert!(session.host_mut().dispatched.is_empty());
+    assert!(session.host.dispatched.is_empty());
 }
 
 #[test]
@@ -203,7 +220,7 @@ fn an_unadvertised_capability_is_reported_as_unsupported_not_denied() {
     let mut session = initialized_session(host);
     let payload = request(&mut session, Method::ExecutionRun, run_params("git"));
     assert_eq!(error_code(payload), ErrorCode::UnsupportedCapability);
-    assert!(session.host_mut().dispatched.is_empty());
+    assert!(session.host.dispatched.is_empty());
 }
 
 #[test]
@@ -211,7 +228,7 @@ fn an_allowlisted_executable_runs() {
     let mut session = initialized_session(RecordingHost::with_all_capabilities());
     let payload = request(&mut session, Method::ExecutionRun, run_params("git"));
     assert!(matches!(payload, ResponsePayload::Ok { .. }));
-    assert_eq!(session.host_mut().dispatched, [Method::ExecutionRun]);
+    assert_eq!(session.host.dispatched, [Method::ExecutionRun]);
 }
 
 #[test]
@@ -225,7 +242,7 @@ fn an_executable_outside_the_allowlist_is_denied() {
             "`{executable}` must be denied"
         );
     }
-    assert!(session.host_mut().dispatched.is_empty());
+    assert!(session.host.dispatched.is_empty());
 }
 
 #[test]
@@ -237,7 +254,7 @@ fn a_malformed_execution_request_is_rejected_before_dispatch() {
         json!({ "executable": "git" }),
     );
     assert_eq!(error_code(payload), ErrorCode::InvalidRequest);
-    assert!(session.host_mut().dispatched.is_empty());
+    assert!(session.host.dispatched.is_empty());
 }
 
 #[test]
@@ -257,7 +274,7 @@ fn a_plugin_may_only_drive_a_panel_it_declared() {
         json!({ "panel_id": "someone-elses-panel", "status": { "state": "loading" } }),
     );
     assert_eq!(error_code(other), ErrorCode::PermissionDenied);
-    assert_eq!(session.host_mut().dispatched, [Method::PanelSetState]);
+    assert_eq!(session.host.dispatched, [Method::PanelSetState]);
 }
 
 #[test]
@@ -265,11 +282,13 @@ fn declaring_contributions_grants_the_matching_ui_permissions() {
     let session = session(RecordingHost::with_all_capabilities());
     assert!(
         session
+            .session
             .permissions()
             .contains(extension_protocol::Permission::UiPanel)
     );
     assert!(
         session
+            .session
             .permissions()
             .contains(extension_protocol::Permission::UiCommands)
     );
@@ -283,11 +302,11 @@ fn events_and_responses_from_a_plugin_are_dropped_rather_than_answered() {
         extension_protocol::EventKind::PanelAction,
         json!({}),
     ));
-    assert!(session.handle_message(event).is_none());
+    assert!(session.handle(event).is_none());
 
     let response = Message::Response(extension_protocol::ResponseEnvelope::ok("9", json!({})));
-    assert!(session.handle_message(response).is_none());
-    assert!(session.host_mut().dispatched.is_empty());
+    assert!(session.handle(response).is_none());
+    assert!(session.host.dispatched.is_empty());
 }
 
 #[test]

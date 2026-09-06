@@ -150,7 +150,7 @@ fn run(options: Options) -> Result<(), String> {
         .map_err(|err| err.to_string())?;
 
     let input = spawn_stdin_reader();
-    let host = DevHost {
+    let mut host = DevHost {
         options_cwd: options.cwd.clone(),
         repository: options.repository.clone(),
         target: options.target.clone(),
@@ -159,7 +159,7 @@ fn run(options: Options) -> Result<(), String> {
         last_panel: Rc::new(RefCell::new(None)),
     };
     let last_panel = Rc::clone(&host.last_panel);
-    let mut session = Session::new(manifest.clone(), host);
+    let mut session = Session::new(manifest.clone());
 
     println!("{DIM}type `q` to quit, or `--help` output for the rest{RESET}\n");
 
@@ -169,7 +169,7 @@ fn run(options: Options) -> Result<(), String> {
                 if options.trace {
                     trace_incoming(&message);
                 }
-                if let Some(reply) = session.handle_message(*message) {
+                if let Some(reply) = session.handle_message(*message, &mut host) {
                     process.send(&reply).map_err(|err| err.to_string())?;
                 }
                 continue;

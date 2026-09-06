@@ -22,20 +22,22 @@ pub trait ExtensionHost {
 }
 
 /// One extension's connection state and the gates its requests pass through.
-pub struct Session<H: ExtensionHost> {
+///
+/// The host is passed to each call rather than owned, because the app-side
+/// implementation borrows live application state: it exists only for the
+/// duration of one dispatch and cannot be stored alongside the session.
+pub struct Session {
     manifest: ExtensionManifest,
     permissions: PermissionSet,
-    host: H,
     initialized: bool,
 }
 
-impl<H: ExtensionHost> Session<H> {
-    pub fn new(manifest: ExtensionManifest, host: H) -> Self {
+impl Session {
+    pub fn new(manifest: ExtensionManifest) -> Self {
         let permissions = manifest.effective_permissions();
         Self {
             manifest,
             permissions,
-            host,
             initialized: false,
         }
     }
@@ -52,33 +54,40 @@ impl<H: ExtensionHost> Session<H> {
         self.initialized
     }
 
-    pub fn host_mut(&mut self) -> &mut H {
-        &mut self.host
-    }
-
     /// Handles one inbound message, returning the reply to write back.
     ///
     /// Messages a plugin should not be sending — responses and events, neither
     /// of which the host solicits in v0.1 — are dropped rather than answered,
     /// because there is nothing to answer.
-    pub fn handle_message(&mut self, message: Message) -> Option<Message> {
+    pub fn handle_message<H: ExtensionHost>(
+        &mut self,
+        message: Message,
+        host: &mut H,
+    ) -> Option<Message> {
         match message {
-            Message::Request(request) => Some(Message::Response(self.handle_request(request))),
+            Message::Request(request) => {
+                Some(Message::Response(self.handle_request(request, host)))
+            }
             Message::Event(_) | Message::Response(_) => None,
         }
     }
 
-    fn handle_request(&mut self, request: RequestEnvelope) -> ResponseEnvelope {
+    fn handle_request<H: ExtensionHost>(
+        &mut self,
+        request: RequestEnvelope,
+        host: &mut H,
+    ) -> ResponseEnvelope {
         let request_id = request.request_id.clone();
-        match self.dispatch_request(request) {
+        match self.dispatch_request(request, host) {
             Ok(result) => ResponseEnvelope::ok(request_id, result),
             Err(error) => ResponseEnvelope::error(request_id, error),
         }
     }
 
-    fn dispatch_request(
+    fn dispatch_request<H: ExtensionHost>(
         &mut self,
         request: RequestEnvelope,
+        host: &mut H,
     ) -> Result<serde_json::Value, ExtensionError> {
         if request.protocol != PROTOCOL_VERSION {
             return Err(ExtensionError::new(
@@ -91,7 +100,7 @@ impl<H: ExtensionHost> Session<H> {
         }
 
         if request.method == Method::ExtensionInitialize {
-            return self.initialize(&request.params);
+            return self.initialize(&request.params, host);
         }
         if !self.initialized {
             return Err(ExtensionError::new(
@@ -103,16 +112,17 @@ impl<H: ExtensionHost> Session<H> {
             ));
         }
 
-        self.ensure_capability(request.method)?;
+        self.ensure_capability(request.method, host)?;
         self.ensure_permission(request.method)?;
         self.ensure_request_policy(request.method, &request.params)?;
 
-        self.host.dispatch(request.method, request.params)
+        host.dispatch(request.method, request.params)
     }
 
-    fn initialize(
+    fn initialize<H: ExtensionHost>(
         &mut self,
         params: &serde_json::Value,
+        host: &H,
     ) -> Result<serde_json::Value, ExtensionError> {
         let params: InitializeParams = decode_params(Method::ExtensionInitialize, params)?;
         if params.extension_id != self.manifest.id {
@@ -139,7 +149,7 @@ impl<H: ExtensionHost> Session<H> {
         let result = InitializeResult {
             protocol: PROTOCOL_VERSION,
             api_version: API_VERSION,
-            capabilities: self.host.capabilities(),
+            capabilities: host.capabilities(),
         };
         serde_json::to_value(result).map_err(|err| {
             ExtensionError::with_details(
@@ -150,11 +160,15 @@ impl<H: ExtensionHost> Session<H> {
         })
     }
 
-    fn ensure_capability(&self, method: Method) -> Result<(), ExtensionError> {
+    fn ensure_capability<H: ExtensionHost>(
+        &self,
+        method: Method,
+        host: &H,
+    ) -> Result<(), ExtensionError> {
         let Some(required) = method.capability() else {
             return Ok(());
         };
-        if self.host.capabilities().contains(&required) {
+        if host.capabilities().contains(&required) {
             return Ok(());
         }
         Err(ExtensionError::new(
