@@ -1,0 +1,236 @@
+//! Handshake, gating and dispatch for one connected extension.
+use extension_protocol::{
+    API_VERSION, Capability, ErrorCode, ExecutionRunParams, ExtensionError, ExtensionManifest,
+    InitializeParams, InitializeResult, Message, Method, PROTOCOL_VERSION, PanelViewState,
+    PermissionSet, RequestEnvelope, ResponseEnvelope, decode_params,
+};
+
+/// The Warp side of the extension API.
+///
+/// The app implements this; everything above it — permissions, capabilities,
+/// the handshake — is enforced before a call reaches an implementation, so an
+/// implementor never has to re-check whether a plugin was allowed to ask.
+pub trait ExtensionHost {
+    /// Capabilities this build actually implements, advertised at handshake.
+    fn capabilities(&self) -> Vec<Capability>;
+
+    fn dispatch(
+        &mut self,
+        method: Method,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, ExtensionError>;
+}
+
+/// One extension's connection state and the gates its requests pass through.
+pub struct Session<H: ExtensionHost> {
+    manifest: ExtensionManifest,
+    permissions: PermissionSet,
+    host: H,
+    initialized: bool,
+}
+
+impl<H: ExtensionHost> Session<H> {
+    pub fn new(manifest: ExtensionManifest, host: H) -> Self {
+        let permissions = manifest.effective_permissions();
+        Self {
+            manifest,
+            permissions,
+            host,
+            initialized: false,
+        }
+    }
+
+    pub fn manifest(&self) -> &ExtensionManifest {
+        &self.manifest
+    }
+
+    pub fn permissions(&self) -> &PermissionSet {
+        &self.permissions
+    }
+
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
+    }
+
+    pub fn host_mut(&mut self) -> &mut H {
+        &mut self.host
+    }
+
+    /// Handles one inbound message, returning the reply to write back.
+    ///
+    /// Messages a plugin should not be sending — responses and events, neither
+    /// of which the host solicits in v0.1 — are dropped rather than answered,
+    /// because there is nothing to answer.
+    pub fn handle_message(&mut self, message: Message) -> Option<Message> {
+        match message {
+            Message::Request(request) => Some(Message::Response(self.handle_request(request))),
+            Message::Event(_) | Message::Response(_) => None,
+        }
+    }
+
+    fn handle_request(&mut self, request: RequestEnvelope) -> ResponseEnvelope {
+        let request_id = request.request_id.clone();
+        match self.dispatch_request(request) {
+            Ok(result) => ResponseEnvelope::ok(request_id, result),
+            Err(error) => ResponseEnvelope::error(request_id, error),
+        }
+    }
+
+    fn dispatch_request(
+        &mut self,
+        request: RequestEnvelope,
+    ) -> Result<serde_json::Value, ExtensionError> {
+        if request.protocol != PROTOCOL_VERSION {
+            return Err(ExtensionError::new(
+                ErrorCode::ProtocolMismatch,
+                format!(
+                    "request declares protocol version {}, expected {PROTOCOL_VERSION}",
+                    request.protocol
+                ),
+            ));
+        }
+
+        if request.method == Method::ExtensionInitialize {
+            return self.initialize(&request.params);
+        }
+        if !self.initialized {
+            return Err(ExtensionError::new(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "{} was called before extension.initialize",
+                    request.method.as_str()
+                ),
+            ));
+        }
+
+        self.ensure_capability(request.method)?;
+        self.ensure_permission(request.method)?;
+        self.ensure_request_policy(request.method, &request.params)?;
+
+        self.host.dispatch(request.method, request.params)
+    }
+
+    fn initialize(
+        &mut self,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, ExtensionError> {
+        let params: InitializeParams = decode_params(Method::ExtensionInitialize, params)?;
+        if params.extension_id != self.manifest.id {
+            return Err(ExtensionError::with_details(
+                ErrorCode::InvalidRequest,
+                "handshake identifies a different extension",
+                format!(
+                    "manifest declares `{}`, handshake claims `{}`",
+                    self.manifest.id, params.extension_id
+                ),
+            ));
+        }
+        if params.api_version != API_VERSION {
+            return Err(ExtensionError::new(
+                ErrorCode::ProtocolMismatch,
+                format!(
+                    "extension requests api_version {}, this build supports {API_VERSION}",
+                    params.api_version
+                ),
+            ));
+        }
+
+        self.initialized = true;
+        let result = InitializeResult {
+            protocol: PROTOCOL_VERSION,
+            api_version: API_VERSION,
+            capabilities: self.host.capabilities(),
+        };
+        serde_json::to_value(result).map_err(|err| {
+            ExtensionError::with_details(
+                ErrorCode::InvalidRequest,
+                "failed to encode handshake result",
+                err.to_string(),
+            )
+        })
+    }
+
+    fn ensure_capability(&self, method: Method) -> Result<(), ExtensionError> {
+        let Some(required) = method.capability() else {
+            return Ok(());
+        };
+        if self.host.capabilities().contains(&required) {
+            return Ok(());
+        }
+        Err(ExtensionError::new(
+            ErrorCode::UnsupportedCapability,
+            format!(
+                "{} requires capability {required}, which this Warp build does not advertise",
+                method.as_str()
+            ),
+        ))
+    }
+
+    fn ensure_permission(&self, method: Method) -> Result<(), ExtensionError> {
+        let Some(required) = method.permission() else {
+            return Ok(());
+        };
+        if self.permissions.contains(required) {
+            return Ok(());
+        }
+        Err(ExtensionError::new(
+            ErrorCode::PermissionDenied,
+            format!(
+                "{} requires the {required} permission, which this extension did not declare",
+                method.as_str()
+            ),
+        ))
+    }
+
+    /// Per-method policy that depends on the request body rather than only the
+    /// method: the executable allowlist, and the rule that a plugin may only
+    /// drive a panel it declared.
+    fn ensure_request_policy(
+        &self,
+        method: Method,
+        params: &serde_json::Value,
+    ) -> Result<(), ExtensionError> {
+        match method {
+            Method::ExecutionRun => {
+                let params: ExecutionRunParams = decode_params(method, params)?;
+                if !self.manifest.allows_executable(&params.executable) {
+                    return Err(ExtensionError::with_details(
+                        ErrorCode::PermissionDenied,
+                        format!("`{}` is not an allowed executable", params.executable),
+                        format!(
+                            "allowed: {}",
+                            self.manifest.execution.allowed_executables.join(", ")
+                        ),
+                    ));
+                }
+                Ok(())
+            }
+            Method::PanelSetState => {
+                let params: PanelViewState = decode_params(method, params)?;
+                if !self.manifest.declares_panel(&params.panel_id) {
+                    return Err(ExtensionError::new(
+                        ErrorCode::PermissionDenied,
+                        format!(
+                            "panel `{}` was not declared by this extension",
+                            params.panel_id
+                        ),
+                    ));
+                }
+                Ok(())
+            }
+            Method::ExtensionInitialize
+            | Method::WorkspaceGetContext
+            | Method::FileOpen
+            | Method::DiffOpenWorkingTree
+            | Method::DiffOpenFile
+            | Method::NotificationShow
+            | Method::DialogConfirm
+            | Method::DialogInput
+            | Method::DialogSelect => Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "session_tests.rs"]
+mod tests;

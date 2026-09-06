@@ -1,0 +1,26 @@
+id = "dev.warp.example"
+name = "Warp Extension Example"
+version = "0.1.0"
+api_version = 1
+
+command = "./warp-extension-example"
+
+[activation]
+workspace_contains = [".git"]
+
+[permissions]
+workspace_read = true
+process_execute = true
+ui_notifications = true
+
+[execution]
+allowed_executables = ["echo"]
+
+[[commands]]
+id = "example.hello"
+title = "Example: Say Hello"
+
+[[panels]]
+id = "example"
+title = "Example"
+location = "left"

@@ -1,0 +1,13 @@
+[package]
+name = "extension_protocol"
+edition = "2024"
+description = "Wire protocol, manifest, permission and capability types for Warp extensions"
+authors.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+toml = "0.8"
