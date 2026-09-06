@@ -290,6 +290,7 @@ fn a_panel_action_round_trips_back_into_a_diff_request() {
         EventKind::PanelAction,
         &PanelActionParams {
             panel_id: "example".to_owned(),
+            section_id: "example.context".to_owned(),
             item_id: "README.md".to_owned(),
             action_id: "open_diff".to_owned(),
             origin: ActionOrigin {

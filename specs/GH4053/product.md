@@ -167,8 +167,10 @@ Non-goals for v0.1 (explicitly deferred):
     plugin's message; an empty model renders Warp's standard empty state.
 
 26. Activating a row or a row action sends a `panel.action` event naming the
-    panel, the item id, and the action id, again carrying the originating
-    workspace, session and repository identity.
+    panel, the section, the item id, and the action id, again carrying the
+    originating workspace, session and repository identity. The section is part
+    of the identity because item ids are only unique within a section — the same
+    file legitimately appears in more than one.
 
 ### Workspace context and execution targeting
 

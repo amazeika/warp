@@ -109,6 +109,12 @@ pub struct CommandInvokedParams {
 #[serde(deny_unknown_fields)]
 pub struct PanelActionParams {
     pub panel_id: String,
+    /// The section the row was rendered in.
+    ///
+    /// Item ids are only unique within a section — the same path legitimately
+    /// appears in more than one, staged and unstaged being the obvious case —
+    /// so without this a plugin cannot tell which row the user activated.
+    pub section_id: String,
     pub item_id: String,
     pub action_id: String,
     pub origin: ActionOrigin,

@@ -43,8 +43,10 @@ cloud_object_client = { path = "crates/cloud_object_client" }
 cloud_object_persistence = { path = "crates/cloud_object_persistence" }
 cloud_object_models = { path = "crates/cloud_object_models" }
 computer_use = { path = "crates/computer_use" }
+extension_git = { path = "crates/extension_git" }
 extension_host = { path = "crates/extension_host" }
 extension_protocol = { path = "crates/extension_protocol" }
+extension_sdk = { path = "crates/extension_sdk" }
 field_mask = { path = "crates/field_mask" }
 firebase = { path = "crates/firebase" }
 fuzzy_match = { path = "crates/fuzzy_match" }

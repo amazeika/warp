@@ -4917,10 +4917,26 @@ version = "0.0.0"
 dependencies = [
  "extension_host",
  "extension_protocol",
+ "extension_sdk",
  "instant",
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "extension_git"
+version = "0.0.0"
+dependencies = [
+ "command",
+ "extension_host",
+ "extension_protocol",
+ "extension_sdk",
+ "instant",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.17",
 ]
 
 [[package]]
@@ -4944,6 +4960,16 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.17",
  "toml 0.8.23",
+]
+
+[[package]]
+name = "extension_sdk"
+version = "0.0.0"
+dependencies = [
+ "extension_protocol",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
 ]
 
 [[package]]

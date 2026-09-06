@@ -1,13 +1,13 @@
 [package]
-name = "extension_example"
+name = "extension_git"
 edition = "2024"
-description = "Reference Warp extension exercising the v0.1 extension API"
+description = "Reference Warp extension providing day-to-day Git functionality"
 authors.workspace = true
 publish.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "warp-extension-example"
+name = "warp-git"
 path = "src/main.rs"
 
 [dependencies]
@@ -15,8 +15,10 @@ extension_protocol.workspace = true
 extension_sdk.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
+command.workspace = true
 extension_host.workspace = true
 instant.workspace = true
 tempfile.workspace = true

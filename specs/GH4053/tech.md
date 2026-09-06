@@ -212,15 +212,52 @@ credential broker, an extension is Warp's own child; parentage is the
 authentication. `codec` and `process` are separated so a socket transport can be
 added later without touching `session`.
 
-### 3. `crates/extension_example` — the proof-of-concept plugin _(PR 1)_
+### 3. `crates/extension_sdk` — optional client conveniences _(PR 1)_
+
+Request correlation and typed call wrappers, so a Rust plugin does not rewrite
+them. Optional by design: the wire protocol is the compatibility layer, and a
+plugin in any language that can frame JSON on stdio is a first-class plugin.
+`ClientError` keeps a refusal (`permission_denied`, `unsupported_capability`)
+distinct from a transport failure, because the first is a normal answer a plugin
+should handle and the second is not.
+
+### 4. `crates/extension_example` — the proof-of-concept plugin _(PR 1)_
 
 `warp-extension-example`: a plugin that performs the handshake, prints the
-workspace context, registers one command, runs one allow-listed harmless
-command, opens one file, opens one diff and shows one notification. It exists so
-the API is proven without Git complexity, and it is the fixture the host's
-end-to-end test drives, so the example cannot rot.
+workspace context, runs one allow-listed harmless command, opens one file, opens
+one diff, shows one notification and publishes one panel. It exists so the API
+is proven without Git complexity, and it is the fixture the host's end-to-end
+test drives, so the example cannot rot.
 
-### 4. App-side bridge — `app/src/extensions/` _(PR 2–5)_
+### 5. `crates/extension_git` — the reference Git plugin _(PR 1)_
+
+`warp-git`: the Git MVP as a plugin, with no Git code in Warp core.
+
+This bundles a reference plugin with the core API, which §44 of the originating
+plan advised against. It is included deliberately: an API justified only by a
+toy plugin is an API nobody has load-tested, and building this one immediately
+surfaced a protocol gap — `panel.action` did not identify the section, so a
+plugin could not distinguish a staged row from an unstaged row with the same
+path. That is exactly the kind of defect a reference consumer is for. It stays
+a separate crate and a separate process, so removing it from a core PR is
+deleting a directory.
+
+Structure:
+
+- `git/status.rs` — `status --porcelain=v2 -z --branch`. NUL termination is
+  what makes a path containing a space, a quote or a newline unambiguous, and
+  the rename record's trailing original-path field must be consumed or every
+  later record is misread.
+- `git/branches.rs`, `git/commits.rs` — `for-each-ref` and `log` with explicit
+  formats and ASCII unit/record separators, never Git's human output.
+- `git/operations.rs` — pure argv builders, so the exact command a destructive
+  action would run is assertable without executing it.
+- `state.rs`, `panel.rs` — the repository model and its rendering into
+  `PanelViewState`.
+- `repository.rs` — runs Git through `execution.run`, bound to the target and
+  root it was constructed with.
+
+### 6. App-side bridge — `app/src/extensions/` _(PR 2–5)_
 
 Mirrors `app/src/local_control/`:
 
@@ -237,7 +274,7 @@ Mirrors `app/src/local_control/`:
 - `adapters/` — the `ExtensionHost` implementation, translating protocol types
   into existing app services.
 
-### 5. Internal services the adapters need _(PR 4–5)_
+### 7. Internal services the adapters need _(PR 4–5)_
 
 - **`ExecutionService`** — resolves `ExecutionTarget::Local` to a spawned
   process and `ExecutionTarget::Ssh { session_id }` to
@@ -285,6 +322,9 @@ Unit tests live beside the source as `<module>_tests.rs` included with
 | 15–17, 22 | `codec` and `session` tests: handshake success, wrong `protocol` yields `protocol_mismatch`, un-advertised capability yields `unsupported_capability`, oversized frame yields `invalid_request`, truncated and malformed frames. |
 | 18–21 | `lifecycle` tests over an injected clock: full state sequence, unexpected exit surfaces a restartable failure, three failures in five minutes reaches `Failed`, a fourth is not auto-restarted. |
 | 23–26 | `crates/extension_example/tests/end_to_end.rs` drives the real plugin binary through the real host with a fake `ExtensionHost`: the documented startup sequence, panel state, a `panel.action` event round-tripping back into `diff.openFile`, a denied permission stopping the plugin without disturbing the host, and a handshake that claims a different extension being refused. |
+| Git parsers | `crates/extension_git/src/git/*_tests.rs` run against status output captured verbatim from Git, covering a path staged and then edited again, a rename with its original-path record, a merge conflict, an empty repository, a detached HEAD, divergence, and truncated records. |
+| Git safety | `operations_tests.rs` asserts the argv itself: `--` before every path, `restore --staged` rather than `reset`, `--force-with-lease` and never `--force`, safe delete distinct from force delete, no bulk `clean`, and no argument that could introduce a shell. |
+| Git end to end | `crates/extension_git/tests/end_to_end.rs` runs the real `warp-git` binary against real temporary repositories with a hermetic Git environment: staging changes the actual index, a commit message with quotes crosses as one argv entry, a dismissed dialog leaves the repository untouched, a discard runs nothing before the user agrees, and an unmerged branch delete escalates to a second confirmation before any `--force`. |
 | 27–32 | Adapter tests with a fake `ExecutionService`: context assembly local and SSH, a stale session yields `session_disconnected`, target retained across a focus change, output truncation flagged. |
 | 33–35 | Adapter tests asserting the app service each method calls, and that a remote path routes through the remote transport. |
 | 36 | `logging` tests: the redacting writer drops token-shaped values and environment blocks. |
@@ -300,7 +340,8 @@ prove.
 Per §45 of the plan, and matching the repo's preference for focused PRs:
 
 1. **PR 1 — foundation.** `extension_protocol`, `extension_host`,
-   `extension_example`. No app changes, no UI, no Git.
+   `extension_sdk`, `extension_example`, `extension_git`. No app changes and no
+   UI; the Git plugin is a separate process that Warp core knows nothing about.
 2. **PR 2 — commands, notifications, dialogs.** First app wiring:
    `ExtensionManager`, the bridge, permission prompt, contribution registry.
 3. **PR 3 — panel API.** The `ToolPanelView` registry refactor.

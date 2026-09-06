@@ -1,0 +1,82 @@
+id = "dev.warp.git"
+name = "Warp Git"
+version = "0.1.0"
+api_version = 1
+
+command = "./warp-git"
+
+[activation]
+workspace_contains = [".git"]
+
+[permissions]
+workspace_read = true
+workspace_write = true
+process_execute = true
+ui_notifications = true
+ui_dialogs = true
+git_read = true
+git_mutate = true
+
+[execution]
+allowed_executables = ["git"]
+
+[[commands]]
+id = "git.refresh"
+title = "Git: Refresh"
+
+[[commands]]
+id = "git.stageAll"
+title = "Git: Stage All Changes"
+
+[[commands]]
+id = "git.unstageAll"
+title = "Git: Unstage All Changes"
+
+[[commands]]
+id = "git.commit"
+title = "Git: Commit Staged Changes"
+
+[[commands]]
+id = "git.fetch"
+title = "Git: Fetch"
+
+[[commands]]
+id = "git.pull"
+title = "Git: Pull"
+
+[[commands]]
+id = "git.push"
+title = "Git: Push"
+
+[[commands]]
+id = "git.forcePush"
+title = "Git: Force Push (with lease)"
+
+[[commands]]
+id = "git.createBranch"
+title = "Git: Create Branch"
+
+[[commands]]
+id = "git.switchBranch"
+title = "Git: Switch Branch"
+
+[[commands]]
+id = "git.rebase"
+title = "Git: Rebase Current Branch"
+
+[[commands]]
+id = "git.rebaseContinue"
+title = "Git: Continue Rebase"
+
+[[commands]]
+id = "git.rebaseAbort"
+title = "Git: Abort Rebase"
+
+[[commands]]
+id = "git.mergeAbort"
+title = "Git: Abort Merge"
+
+[[panels]]
+id = "git"
+title = "Git"
+location = "left"

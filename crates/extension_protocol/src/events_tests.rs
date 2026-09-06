@@ -17,6 +17,7 @@ fn wire_names_round_trip() {
 fn panel_action_carries_the_origin_it_started_in() {
     let params = PanelActionParams {
         panel_id: "git".to_owned(),
+        section_id: "git.changes".to_owned(),
         item_id: "src/main.rs".to_owned(),
         action_id: "open_diff".to_owned(),
         origin: ActionOrigin {
