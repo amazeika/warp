@@ -15305,6 +15305,29 @@ impl Workspace {
                 ctx,
             );
         });
+
+        self.notify_extensions_of_context(ctx);
+    }
+
+    /// Tells the extension host that the context it reports to plugins may
+    /// have moved.
+    ///
+    /// The context is assembled here and pushed rather than read back out of
+    /// the workspace registry, because this workspace is borrowed by the call
+    /// that got here. Only the active window says anything: a directory change
+    /// in a window the user is not looking at has not moved where they are
+    /// acting, and the host works out which of the workspace, directory,
+    /// repository or session actually differs.
+    fn notify_extensions_of_context(&self, ctx: &mut ViewContext<Self>) {
+        let window_id = ctx.window_id();
+        if !ctx.has_singleton_model::<ExtensionManager>()
+            || ctx.windows().active_window() != Some(window_id)
+        {
+            return;
+        }
+        ExtensionManager::handle(&*ctx).update(ctx, |extensions, ctx| {
+            extensions.workspace_context_changed(self, window_id, ctx);
+        });
     }
 
     /// Opens the in-app network log pane as a right-split of the active pane
@@ -27854,6 +27877,10 @@ impl View for Workspace {
         if focus_ctx.is_self_focused() {
             self.focus_active_tab(ctx);
         }
+        // Moving between windows changes which workspace a plugin is acting
+        // in without changing anything inside either of them, so the working
+        // directory refresh above never fires for it.
+        self.notify_extensions_of_context(ctx);
     }
 
     /// Update this workspace when it has been closed, but may still be restored.

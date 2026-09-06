@@ -6,12 +6,13 @@
 //! and permission gates by the time a call arrives.
 use extension_host::{Dispatched, ExtensionHost};
 use extension_protocol::{
-    Capability, DialogConfirmParams, ErrorCode, ExtensionError, Method, NotificationLevel,
-    NotificationParams, PanelViewState, decode_params,
+    Capability, DialogConfirmParams, ErrorCode, ExecutionRunParams, ExtensionError, Method,
+    NotificationLevel, NotificationParams, PanelViewState, decode_params,
 };
 use warpui::windowing::WindowManager;
 use warpui::{ModelContext, SingletonEntity as _};
 
+use super::context::{ActiveContext, WorkspaceContextService};
 use super::manager::ExtensionManager;
 use crate::view_components::{DismissibleToast, ToastFlavor};
 use crate::workspace::{ToastStack, WorkspaceAction};
@@ -29,6 +30,8 @@ pub(super) const IMPLEMENTED_CAPABILITIES: &[Capability] = &[
     Capability::PanelTreeV1,
     Capability::NotificationV1,
     Capability::DialogConfirmV1,
+    Capability::WorkspaceContextV1,
+    Capability::ExecutionV1,
 ];
 
 pub(super) struct BridgeHost<'a, 'ctx> {
@@ -47,12 +50,21 @@ pub(super) struct BridgeHost<'a, 'ctx> {
     /// A panel snapshot published by this dispatch, stored by the manager once
     /// its own borrow of the extension has ended, for the same reason.
     pub panel_state: Option<PanelViewState>,
+    /// A command this dispatch accepted, for the manager to start once its own
+    /// borrow of the extension has ended, for the same reason again.
+    pub execution: Option<PendingExecution>,
 }
 
 /// A `dialog.confirm` waiting to be put in front of the user.
 pub(super) struct PendingConfirm {
     pub request_id: String,
     pub params: DialogConfirmParams,
+}
+
+/// An `execution.run` whose target still has to be bound to a transport.
+pub(super) struct PendingExecution {
+    pub request_id: String,
+    pub params: ExecutionRunParams,
 }
 
 impl ExtensionHost for BridgeHost<'_, '_> {
@@ -94,6 +106,20 @@ impl ExtensionHost for BridgeHost<'_, '_> {
                 }
                 Err(error) => Dispatched::Answered(Err(error)),
             },
+            Method::WorkspaceGetContext => Dispatched::Answered(self.workspace_context()),
+            // Nothing is written back here either: the command has not run yet,
+            // and the target it names is bound to a transport by the manager,
+            // which then owes the answer.
+            Method::ExecutionRun => match decode_params(method, &params) {
+                Ok(params) => {
+                    self.execution = Some(PendingExecution {
+                        request_id: request_id.to_owned(),
+                        params,
+                    });
+                    Dispatched::Deferred
+                }
+                Err(error) => Dispatched::Answered(Err(error)),
+            },
             // `dialog.input` and `dialog.select` share the `dialog.confirm.v1`
             // token with the method above, so they reach dispatch rather than
             // being refused by the capability gate. The code is still the right
@@ -103,8 +129,6 @@ impl ExtensionHost for BridgeHost<'_, '_> {
             // advertise at all, so `Session` refuses it before dispatch.
             // Answering here as well keeps the failure honest if that changes.
             Method::ExtensionInitialize
-            | Method::WorkspaceGetContext
-            | Method::ExecutionRun
             | Method::FileOpen
             | Method::DiffOpenWorkingTree
             | Method::DiffOpenFile
@@ -118,6 +142,31 @@ impl ExtensionHost for BridgeHost<'_, '_> {
 }
 
 impl BridgeHost<'_, '_> {
+    /// Answers `workspace.getContext` with the state at the moment it was
+    /// asked, rather than with whatever the last context event described.
+    ///
+    /// A window with no working directory yet is reported as missing rather
+    /// than answered with an invented one: a plugin that runs `git status`
+    /// against a directory Warp guessed is worse off than one that retries.
+    fn workspace_context(&mut self) -> Result<serde_json::Value, ExtensionError> {
+        let context = WorkspaceContextService::current(self.ctx)
+            .as_ref()
+            .and_then(ActiveContext::to_wire)
+            .ok_or_else(|| {
+                ExtensionError::new(
+                    ErrorCode::WorkspaceMissing,
+                    "there is no active workspace with a working directory",
+                )
+            })?;
+        serde_json::to_value(context).map_err(|err| {
+            ExtensionError::with_details(
+                ErrorCode::InvalidRequest,
+                "failed to encode the workspace context",
+                err.to_string(),
+            )
+        })
+    }
+
     fn show_notification(
         &mut self,
         params: NotificationParams,

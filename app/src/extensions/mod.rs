@@ -28,8 +28,10 @@
 //! the UI; everything else — gating, dispatch, and the write back — happens on
 //! the main thread, so extension state needs no locks and a dispatch can touch
 //! models directly.
+mod context;
 mod contributions;
 mod dialog;
+mod execution;
 mod host;
 mod manager;
 mod permissions;

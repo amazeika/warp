@@ -2,6 +2,10 @@ use std::fs;
 
 use extension_protocol::Activation;
 use tempfile::TempDir;
+use warp_util::host_id::HostId;
+use warp_util::local_or_remote_path::LocalOrRemotePath;
+use warp_util::remote_path::RemotePath;
+use warp_util::standardized_path::StandardizedPath;
 
 use super::*;
 
@@ -118,6 +122,88 @@ fn a_workspace_condition_matches_an_ancestor_directory() {
         }),
         Some(&nested)
     ));
+}
+
+const ACTIVATION: &str = r#"
+[activation]
+workspace_contains = [".git"]
+"#;
+
+fn context_in(cwd: LocalOrRemotePath) -> ActiveContext {
+    ActiveContext {
+        workspace_id: "1".to_owned(),
+        active_pane_id: Some("2".to_owned()),
+        cwd: Some(cwd),
+        repository_root: None,
+        session_id: Some(SessionId::from(3)),
+        execution_target: ExecutionTarget::Local,
+    }
+}
+
+#[test]
+fn a_workspace_condition_is_evaluated_once_the_context_says_where_the_user_is() {
+    let root = install(ACTIVATION);
+    let grant_root = TempDir::new().expect("temp dir");
+    let repository = TempDir::new().expect("temp dir");
+    fs::create_dir_all(repository.path().join(".git")).expect(".git");
+
+    warpui::App::test((), |mut app| async move {
+        let manager = app.add_model(|ctx| {
+            ExtensionManager::with_paths(root.path().to_path_buf(), open_grants(&grant_root), ctx)
+        });
+
+        manager.update(&mut app, |manager, ctx| {
+            assert!(
+                manager.asking.is_none() && manager.questions.is_empty(),
+                "with nowhere known to look, the condition has not been shown to hold, so nothing is even asked about"
+            );
+
+            manager.context_moved(
+                Some(context_in(LocalOrRemotePath::Local(
+                    repository.path().to_path_buf(),
+                ))),
+                ctx,
+            );
+            assert_eq!(
+                manager.asking,
+                Some(Outcome::Permission {
+                    extension_id: "dev.warp.test".to_owned()
+                }),
+                "the context is what makes the extension eligible, and the prompt is still the gate"
+            );
+        });
+    });
+}
+
+#[test]
+fn a_remote_directory_is_not_evaluated_against_this_machine() {
+    let root = install(ACTIVATION);
+    let grant_root = TempDir::new().expect("temp dir");
+    let repository = TempDir::new().expect("temp dir");
+    fs::create_dir_all(repository.path().join(".git")).expect(".git");
+    let remote = LocalOrRemotePath::Remote(RemotePath::new(
+        HostId::new("host-1".to_owned()),
+        StandardizedPath::try_new(&repository.path().to_string_lossy()).expect("a remote path"),
+    ));
+
+    warpui::App::test((), |mut app| async move {
+        let manager = app.add_model(|ctx| {
+            ExtensionManager::with_paths(root.path().to_path_buf(), open_grants(&grant_root), ctx)
+        });
+
+        manager.update(&mut app, |manager, ctx| {
+            manager.context_moved(Some(context_in(remote)), ctx);
+
+            assert!(
+                manager.workspace_directory.is_none(),
+                "`workspace_contains` is answered by looking at this file system, which a remote checkout is not on"
+            );
+            assert!(
+                manager.asking.is_none(),
+                "a same-named path on this machine must not activate an extension for a repository on another one"
+            );
+        });
+    });
 }
 
 #[test]

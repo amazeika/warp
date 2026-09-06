@@ -16,17 +16,24 @@ use extension_host::{
 };
 use extension_protocol::{
     ActionOrigin, Activation, CommandInvokedParams, DialogConfirmParams, DialogConfirmResult,
-    EventEnvelope, EventKind, ExecutionTarget, ExtensionManifest, Message, PanelActionParams,
-    PanelViewState, Permission, PermissionSet, ResponseEnvelope,
+    ErrorCode, EventEnvelope, EventKind, ExecutionRunParams, ExecutionTarget, ExtensionError,
+    ExtensionManifest, Message, PanelActionParams, PanelViewState, Permission, PermissionSet,
+    ResponseEnvelope, SessionChangedParams,
 };
 use instant::Instant;
+use warp_core::SessionId;
+use warpui::WindowId;
 use warpui::r#async::Timer;
 use warpui::{AppContext, Entity, ModelContext, ModelSpawner, SingletonEntity};
 
+use super::context::{ActiveContext, WorkspaceContextService, session_id_to_string};
 use super::contributions::{ContributedCommand, ContributedPanel, Contributions};
 use super::dialog::{self, Question};
+use super::execution::ExecutionService;
 use super::host::BridgeHost;
 use super::permissions::{GrantStore, PermissionDecision};
+use crate::remote_server::manager::{RemoteServerManager, RemoteServerManagerEvent};
+use crate::workspace::Workspace;
 
 /// How long a plugin has to answer `extension.initialize`.
 ///
@@ -137,6 +144,14 @@ pub struct ExtensionManager {
     /// workspace context exists, which keeps a `workspace_contains` extension
     /// inactive rather than guessing.
     workspace_directory: Option<PathBuf>,
+    /// The last context Warp described to its extensions.
+    ///
+    /// Its job is to work out which events a change is worth. An action's
+    /// origin is assembled afresh instead, because a value that lags by a
+    /// frame is how an action ends up attached to the pane the user has just
+    /// left — this is only what that falls back to when the workspace cannot
+    /// be read at all.
+    context: Option<ActiveContext>,
     /// Questions waiting for the user, and the one they are looking at.
     ///
     /// Warp asks one at a time: the modal surface holds a single dialog, so a
@@ -178,11 +193,14 @@ impl ExtensionManager {
             rejected: Vec::new(),
             spawner: ctx.spawner(),
             workspace_directory: None,
+            context: None,
             questions: VecDeque::new(),
             asking: None,
             retry_scheduled: false,
             declined: BTreeSet::new(),
         };
+        manager.watch_remote_sessions(ctx);
+        manager.context_changed(ctx);
         manager.refresh(ctx);
         manager
     }
@@ -471,13 +489,6 @@ impl ExtensionManager {
     }
 
     fn answer_dialog(&mut self, extension_id: &str, request_id: String, confirmed: bool) {
-        let Some(running) = self
-            .extensions
-            .get_mut(extension_id)
-            .and_then(|extension| extension.running.as_mut())
-        else {
-            return;
-        };
         let result = match serde_json::to_value(DialogConfirmResult { confirmed }) {
             Ok(result) => result,
             Err(err) => {
@@ -485,10 +496,7 @@ impl ExtensionManager {
                 return;
             }
         };
-        let response = Message::Response(ResponseEnvelope::ok(request_id, result));
-        if let Err(err) = running.process.send(&response) {
-            log::warn!("Failed to answer the dialog for extension {extension_id}: {err}");
-        }
+        self.respond(extension_id, request_id, Ok(result));
     }
 
     /// Tells an extension that the user picked one of its palette entries.
@@ -537,22 +545,223 @@ impl ExtensionManager {
 
     /// Where an action the user just took is anchored.
     ///
-    /// Captured at invocation and carried in the event, so a plugin that is
-    /// slow to respond acts on the workspace the user was looking at rather
-    /// than the one they moved to. Only the window is known at this point; the
-    /// session, repository root and remote execution target arrive with the
-    /// workspace-context service, and are left unset rather than guessed —
-    /// naming the wrong target is how a remote action lands on a local path.
+    /// Assembled at invocation and carried in the event, so a plugin that is
+    /// slow to respond acts on the workspace, session and repository the user
+    /// was looking at rather than the ones they moved to.
+    ///
+    /// Falls back to the last context Warp described, and then to the window
+    /// alone. A build with no workspace to read — a launch mode that never
+    /// opens one, or a test harness — still targets the local machine, which
+    /// is the one target that cannot be aimed at the wrong host; guessing a
+    /// session id would not be.
     fn origin(&self, ctx: &AppContext) -> ActionOrigin {
-        ActionOrigin {
-            workspace_id: ctx
-                .windows()
-                .active_window()
-                .map(|window_id| window_id.to_string())
-                .unwrap_or_default(),
-            session_id: None,
-            repository_root: None,
-            execution_target: ExecutionTarget::Local,
+        WorkspaceContextService::current(ctx)
+            .or_else(|| self.context.clone())
+            .map(|context| context.origin())
+            .unwrap_or_else(|| ActionOrigin {
+                workspace_id: self.workspace_id(ctx),
+                session_id: None,
+                repository_root: None,
+                execution_target: ExecutionTarget::Local,
+            })
+    }
+
+    fn workspace_id(&self, ctx: &AppContext) -> String {
+        ctx.windows()
+            .active_window()
+            .map(|window_id| window_id.to_string())
+            .unwrap_or_default()
+    }
+
+    /// Re-reads the workspace context and tells every running extension what
+    /// moved.
+    fn context_changed(&mut self, ctx: &mut ModelContext<Self>) {
+        let current = WorkspaceContextService::current(ctx);
+        self.context_moved(current, ctx);
+    }
+
+    /// The active workspace saying its context may have moved.
+    ///
+    /// The workspace assembles its own context and hands it over rather than
+    /// being read back out of the registry, because it is borrowed by the call
+    /// that got here.
+    ///
+    /// Diffing here rather than having each caller say what changed is what
+    /// keeps the events honest: a `cd` inside one repository says only that
+    /// the directory moved, and moving between two windows open on the same
+    /// repository says nothing about the repository at all.
+    pub fn workspace_context_changed(
+        &mut self,
+        workspace: &Workspace,
+        window_id: WindowId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let current = WorkspaceContextService::of(workspace, window_id, ctx);
+        self.context_moved(Some(current), ctx);
+    }
+
+    fn context_moved(&mut self, current: Option<ActiveContext>, ctx: &mut ModelContext<Self>) {
+        let events = WorkspaceContextService::changes(self.context.as_ref(), current.as_ref());
+        self.context = current;
+        self.adopt_workspace_directory(ctx);
+        for event in events {
+            match event.encode() {
+                Ok(envelope) => self.broadcast(&Message::Event(envelope)),
+                Err(err) => log::warn!("Failed to encode {}: {err}", event.kind),
+            }
+        }
+    }
+
+    /// Updates the directory activation conditions are evaluated against.
+    ///
+    /// Only a local path qualifies: `workspace_contains` is answered by looking
+    /// at this machine's file system, and a remote checkout is not on it. The
+    /// repository root is preferred over the working directory so that moving
+    /// between two directories of one repository does not re-evaluate anything.
+    fn adopt_workspace_directory(&mut self, ctx: &mut ModelContext<Self>) {
+        let directory = self
+            .context
+            .as_ref()
+            .and_then(|context| context.repository_root.as_ref().or(context.cwd.as_ref()))
+            .and_then(|path| path.to_local_path())
+            .map(Path::to_path_buf);
+        if directory == self.workspace_directory {
+            return;
+        }
+        self.workspace_directory = directory;
+        self.activate_eligible(ctx);
+    }
+
+    /// Follows the SSH sessions Warp holds, so a plugin hears that a target it
+    /// is holding has gone before it tries to use it.
+    ///
+    /// These two events are about the transport, not about focus. A user
+    /// moving to a local tab has disconnected nothing, and saying otherwise
+    /// would make a plugin abandon a session that is still there; that move is
+    /// `session.changed`, which is what the context diff emits.
+    fn watch_remote_sessions(&mut self, ctx: &mut ModelContext<Self>) {
+        if !ctx.has_singleton_model::<RemoteServerManager>() {
+            return;
+        }
+        let remote = RemoteServerManager::handle(ctx);
+        ctx.subscribe_to_model(&remote, |manager, _, event, ctx| {
+            let (kind, session_id) = match event {
+                RemoteServerManagerEvent::SessionConnected { session_id, .. } => {
+                    (EventKind::SshConnected, *session_id)
+                }
+                RemoteServerManagerEvent::SessionDisconnected { session_id, .. } => {
+                    (EventKind::SshDisconnected, *session_id)
+                }
+                _ => return,
+            };
+            manager.announce_session(kind, session_id, ctx);
+        });
+    }
+
+    /// Tells every running extension that one SSH session came or went.
+    ///
+    /// The target is named in full rather than only by id, so a plugin can
+    /// compare it against the one it is holding without reconstructing it.
+    fn announce_session(
+        &mut self,
+        kind: EventKind,
+        session_id: SessionId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let session_id = session_id_to_string(session_id);
+        let params = SessionChangedParams {
+            workspace_id: self.workspace_id(ctx),
+            session_id: Some(session_id.clone()),
+            execution_target: ExecutionTarget::Ssh { session_id },
+        };
+        match EventEnvelope::with_params(kind, &params) {
+            Ok(envelope) => self.broadcast(&Message::Event(envelope)),
+            Err(err) => log::warn!("Failed to encode {kind}: {err}"),
+        }
+    }
+
+    /// Sends one message to every extension that has finished its handshake.
+    ///
+    /// A plugin that has not negotiated capabilities yet is skipped: it has
+    /// not been told what this build supports, so it has no way to read an
+    /// event against the version of the API it expected.
+    fn broadcast(&mut self, message: &Message) {
+        for (extension_id, extension) in &mut self.extensions {
+            let Some(running) = extension.running.as_mut() else {
+                continue;
+            };
+            if !running.session.is_initialized() {
+                continue;
+            }
+            if let Err(err) = running.process.send(message) {
+                log::warn!("Failed to deliver an event to extension {extension_id}: {err}");
+            }
+        }
+    }
+
+    /// Runs a command an extension asked for, on the target it named.
+    ///
+    /// The target is bound to its transport here, on the main thread, before
+    /// anything is awaited. That is what invariant 31 costs: once the command
+    /// is in flight there is nothing left to resolve, so a focus change cannot
+    /// move it, and a session that ends underneath it fails rather than being
+    /// retried somewhere else.
+    pub(super) fn run_execution(
+        &mut self,
+        extension_id: &str,
+        request_id: String,
+        params: ExecutionRunParams,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let runner = match ExecutionService::resolve(&params.target, ctx) {
+            Ok(runner) => runner,
+            Err(error) => {
+                self.respond(extension_id, request_id, Err(error));
+                return;
+            }
+        };
+        let extension_id = extension_id.to_owned();
+        ctx.spawn(
+            async move { runner.run(params).await },
+            move |manager, result, _| {
+                let result = result.and_then(|result| {
+                    serde_json::to_value(result).map_err(|err| {
+                        ExtensionError::with_details(
+                            ErrorCode::ExecutionFailed,
+                            "failed to encode the command result",
+                            err.to_string(),
+                        )
+                    })
+                });
+                manager.respond(&extension_id, request_id, result);
+            },
+        );
+    }
+
+    /// Writes one deferred answer back to the plugin waiting for it.
+    ///
+    /// An extension that stopped while its answer was being produced is not
+    /// written to: there is no longer a request to answer, and the process the
+    /// handle named is gone.
+    fn respond(
+        &mut self,
+        extension_id: &str,
+        request_id: String,
+        result: Result<serde_json::Value, ExtensionError>,
+    ) {
+        let Some(running) = self
+            .extensions
+            .get_mut(extension_id)
+            .and_then(|extension| extension.running.as_mut())
+        else {
+            return;
+        };
+        let response = match result {
+            Ok(result) => ResponseEnvelope::ok(request_id, result),
+            Err(error) => ResponseEnvelope::error(request_id, error),
+        };
+        if let Err(err) = running.process.send(&Message::Response(response)) {
+            log::warn!("Failed to answer extension {extension_id}: {err}");
         }
     }
 
@@ -694,7 +903,7 @@ impl ExtensionManager {
         message: Message,
         ctx: &mut ModelContext<Self>,
     ) -> bool {
-        let (became_initialized, question, panel_state) = {
+        let (became_initialized, question, panel_state, execution) = {
             let Some(extension) = self.extensions.get_mut(extension_id) else {
                 return false;
             };
@@ -709,10 +918,12 @@ impl ExtensionManager {
                 ctx,
                 question: None,
                 panel_state: None,
+                execution: None,
             };
             let reply = running.session.handle_message(message, &mut host);
             let question = host.question;
             let panel_state = host.panel_state;
+            let execution = host.execution;
 
             if let Some(reply) = reply
                 && let Err(err) = running.process.send(&reply)
@@ -724,16 +935,19 @@ impl ExtensionManager {
             if became_initialized {
                 extension.state.running();
             }
-            (became_initialized, question, panel_state)
+            (became_initialized, question, panel_state, execution)
         };
 
-        // Applied out here because both touch the manager as a whole, and the
+        // Applied out here because each touches the manager as a whole, and the
         // dispatch above held it borrowed for one extension.
         if let Some(state) = panel_state {
             self.set_panel_state(extension_id, state, ctx);
         }
         if let Some(question) = question {
             self.confirm(extension_id, question.request_id, question.params, ctx);
+        }
+        if let Some(execution) = execution {
+            self.run_execution(extension_id, execution.request_id, execution.params, ctx);
         }
         became_initialized
     }
